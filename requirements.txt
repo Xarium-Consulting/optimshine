@@ -9,6 +9,7 @@ coverage==7.8.0
 cryptography==45.0.3
 freezegun==1.5.1
 h5py==3.13.0
+hypothesis==6.140.2  # test-only
 idna==3.10
 numpy==2.2.5
 pandas==2.2.3
