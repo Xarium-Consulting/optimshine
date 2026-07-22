@@ -31,7 +31,8 @@ SHINE_PV_DATA_LABELS = {
     "emsPower": "Battery Power",
 }
 SHINE_DEVICE_VALUES = {
-    "battery_soc": "emsSoc"
+    "battery_soc": "emsSoc",
+    "pv_power": "pvTotalPower",
 }
 SHINE_SETTING_VALUES = {
     "battery_charge_current": "bmchc",
@@ -392,7 +393,8 @@ class ApiShine(ApiCommon):
         Args:
             inverter_serial_number (str): The serial number of the inverter.
             value_name (str): The name of the value to retrieve.
-                              Currently supported value names: battery_soc
+                              Currently supported value names: battery_soc,
+                              pv_power
 
         Returns:
             bool: True if the value was successfully obtained, False otherwise.

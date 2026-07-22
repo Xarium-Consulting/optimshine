@@ -260,20 +260,20 @@ class TestOptimShine(unittest.TestCase):
         self.assertFalse(self.cl.not_cloudy)
         self.assertTrue(status)
 
-    def test_get_judge_factors_no_plant(self):
-        status = self.cl._get_judge_factors()
+    def test_get_daily_judge_factors_no_plant(self):
+        status = self.cl._get_daily_judge_factors()
 
         stdout = self.stdio.getvalue()
         self.assertIn("No plant info available", stdout)
         self.assertFalse(status)
 
-    def test_get_judge_factors_check_weather_fail(self):
+    def test_get_daily_judge_factors_check_weather_fail(self):
         self.cl._check_weather = MagicMock()
         self.cl._check_weather.return_value = False
         self.cl.plant = {"latitude": "0.0000", "longitude": "10.0000"}
         date = datetime.now().strftime("%Y-%m-%d")
 
-        status = self.cl._get_judge_factors()
+        status = self.cl._get_daily_judge_factors()
 
         stdout = self.stdio.getvalue()
         self.assertIn("Failed to check weather", stdout)
@@ -281,7 +281,7 @@ class TestOptimShine(unittest.TestCase):
                                                        date)
         self.assertFalse(status)
 
-    def test_get_judge_factors_get_pse_data_fail(self):
+    def test_get_daily_judge_factors_get_pse_data_fail(self):
         self.cl._check_weather = MagicMock()
         self.cl._check_weather.return_value = True
         self.cl.get_pse_data = MagicMock()
@@ -290,7 +290,7 @@ class TestOptimShine(unittest.TestCase):
         date = datetime.now().strftime("%Y-%m-%d")
         self.cl.not_cloudy = False
 
-        status = self.cl._get_judge_factors()
+        status = self.cl._get_daily_judge_factors()
 
         stdout = self.stdio.getvalue()
         self.assertIn("Failed to get RCE prices", stdout)
@@ -299,7 +299,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl.get_pse_data.assert_called_once_with(date)
         self.assertFalse(status)
 
-    def test_get_judge_factors_pass(self):
+    def test_get_daily_judge_factors_pass(self):
         self.cl._check_weather = MagicMock()
         self.cl._check_weather.return_value = True
         self.cl.get_pse_data = MagicMock()
@@ -323,7 +323,7 @@ class TestOptimShine(unittest.TestCase):
             tzinfo=ZoneInfo("Europe/Warsaw")
         ).timestamp()
 
-        status = self.cl._get_judge_factors()
+        status = self.cl._get_daily_judge_factors()
 
         stdout = self.stdio.getvalue()
         self.assertIn("Successfully obtained judge factors", stdout)
@@ -333,6 +333,176 @@ class TestOptimShine(unittest.TestCase):
         self.assertTrue(status)
         self.assertEqual(self.cl.min_price, 59.58)
         self.assertEqual(self.cl.min_price_timestamp, expected_timestamp)
+
+    def _setup_current_judge_factors(self):
+        """
+        Configure the common state and mocks used by the
+        _get_current_judge_factors tests: a valid token, weather data, RCE
+        prices, and stubbed helpers. Individual tests override pieces as
+        needed.
+        """
+        self.cl.token_ttl = (
+            datetime.now() + timedelta(minutes=30)
+        ).timestamp()
+        self.cl.weather_data = {
+            "sunrise_time": (datetime.now() - timedelta(hours=3)).timestamp(),
+            "sunset_time": (datetime.now() + timedelta(hours=3)).timestamp(),
+            "first_sample_time": 0,
+            "interval": 3600,
+            "low_clouds_data": [0.1],
+        }
+        self.cl.rce_prices = {123456: 250.0}
+        self.cl.get_timestamp_quarter = MagicMock(return_value=123456)
+        self.cl._check_current_weather = MagicMock(return_value=True)
+        self.cl.get_current_miner_profitability = MagicMock(return_value=True)
+        self.cl.profitability = 1.5
+
+    def test_get_current_judge_factors_no_weather_data(self):
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("No weather data available!", stdout)
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_no_rce_prices(self):
+        self.cl.weather_data = {}
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("No RCE prices available!", stdout)
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_reauthorization_failed(self):
+        self._setup_current_judge_factors()
+        self.cl.token_ttl = (
+            datetime.now() - timedelta(minutes=30)
+        ).timestamp()
+        self.cl.login_shine = MagicMock(return_value=False)
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Authorization token has expired", stdout)
+        self.cl.login_shine.assert_called_once()
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_check_weather_fail(self):
+        self._setup_current_judge_factors()
+        self.cl._check_current_weather = MagicMock(return_value=False)
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Checking current weather failed!", stdout)
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_rce_quarter_missing(self):
+        self._setup_current_judge_factors()
+        self.cl.rce_prices = {999999: 250.0}
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Current quarter not found in RCE prices", stdout)
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_get_soc_fail(self):
+        self._setup_current_judge_factors()
+        self.cl.get_device_value = MagicMock(return_value=False)
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Getting battery state of charge failed", stdout)
+        self.cl.get_device_value.assert_called_once_with("INV", "battery_soc")
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_get_pv_fail(self):
+        self._setup_current_judge_factors()
+        self.cl.get_device_value = MagicMock(side_effect=[True, False])
+        self.cl.device_value = 55
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Getting PV production failed", stdout)
+        self.cl.get_device_value.assert_has_calls([
+            call("INV", "battery_soc"),
+            call("INV", "pv_power"),
+        ])
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_profitability_fail(self):
+        self._setup_current_judge_factors()
+
+        def _device_value(_inv, _name):
+            self.cl.device_value = 55
+            return True
+
+        self.cl.get_device_value = MagicMock(side_effect=_device_value)
+        self.cl.get_current_miner_profitability = MagicMock(return_value=False)
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Getting miner profitability failed", stdout)
+        self.assertFalse(status)
+
+    def test_get_current_judge_factors_night_pass(self):
+        self._setup_current_judge_factors()
+        # Force the night branch: sunrise in the future.
+        self.cl.weather_data["sunrise_time"] = (
+            datetime.now() + timedelta(hours=1)
+        ).timestamp()
+        self.cl.get_device_value = MagicMock(return_value=True)
+        # SoC first, PV second.
+        soc_pv = iter([41.0, 1543.0])
+
+        def _device_value(_inv, _name):
+            self.cl.device_value = next(soc_pv)
+            return True
+
+        self.cl.get_device_value = MagicMock(side_effect=_device_value)
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Successfully obtained current judge factors", stdout)
+        self.assertTrue(status)
+        self.assertTrue(self.cl.if_night)
+        self.cl._check_current_weather.assert_not_called()
+        self.assertEqual(self.cl.current_soc, 41.0)
+        self.assertEqual(self.cl.current_pv_power, 1543.0)
+        self.assertEqual(self.cl.current_rce_price, 250.0)
+        self.assertEqual(
+            self.cl.miner_profitability,
+            {"Eco": 1.5, "Standard": 1.5, "Super": 1.5},
+        )
+
+    def test_get_current_judge_factors_day_pass(self):
+        self._setup_current_judge_factors()
+        soc_pv = iter([41.0, 1543.0])
+
+        def _device_value(_inv, _name):
+            self.cl.device_value = next(soc_pv)
+            return True
+
+        self.cl.get_device_value = MagicMock(side_effect=_device_value)
+
+        status = self.cl._get_current_judge_factors("INV")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Successfully obtained current judge factors", stdout)
+        self.assertTrue(status)
+        self.assertFalse(self.cl.if_night)
+        self.cl._check_current_weather.assert_called_once()
+        self.assertEqual(self.cl.current_soc, 41.0)
+        self.assertEqual(self.cl.current_pv_power, 1543.0)
+        self.assertEqual(self.cl.current_rce_price, 250.0)
+        self.assertEqual(
+            self.cl.get_current_miner_profitability.call_count, 3
+        )
 
     def test_optim_charge_battery_reauthorization_failed(self):
         token_ttl_date = datetime.now() - timedelta(minutes=30)
@@ -678,10 +848,10 @@ class TestOptimShine(unittest.TestCase):
         self.assertEqual(job_optim.kwargs["mode"], "fast_charge")
         self.assertTrue(status)
 
-    def test_optim_judge_get_judge_factors_fail(self):
+    def test_optim_judge_get_daily_judge_factors_fail(self):
         self.cl.judge_date = datetime.now()
-        self.cl._get_judge_factors = MagicMock()
-        self.cl._get_judge_factors.return_value = False
+        self.cl._get_daily_judge_factors = MagicMock()
+        self.cl._get_daily_judge_factors.return_value = False
 
         with self.assertRaises(RuntimeError):
             self.cl.optim_judge()
@@ -694,8 +864,8 @@ class TestOptimShine(unittest.TestCase):
 
     def test_optim_judge_optim_strategy_fail(self):
         self.cl.judge_date = datetime.now()
-        self.cl._get_judge_factors = MagicMock()
-        self.cl._get_judge_factors.return_value = True
+        self.cl._get_daily_judge_factors = MagicMock()
+        self.cl._get_daily_judge_factors.return_value = True
         self.cl._optim_strategy = MagicMock()
         self.cl._optim_strategy.return_value = False
         self.cl.weather_data = {
@@ -714,8 +884,8 @@ class TestOptimShine(unittest.TestCase):
 
     def test_optim_judge_optim_pass(self):
         self.cl.judge_date = datetime.now()
-        self.cl._get_judge_factors = MagicMock()
-        self.cl._get_judge_factors.return_value = True
+        self.cl._get_daily_judge_factors = MagicMock()
+        self.cl._get_daily_judge_factors.return_value = True
         self.cl._optim_strategy = MagicMock()
         self.cl._optim_strategy.return_value = True
         self.cl.weather_data = {

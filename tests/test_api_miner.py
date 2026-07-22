@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
 
+import datetime
 import io
 import json
 import logging
@@ -77,12 +78,16 @@ class TestApiMiner(unittest.TestCase):
     @given(port=st.integers(min_value=1, max_value=65535))
     def test_valid_port_passthrough(self, port):
         cls_api_miner = api.ApiMiner(self.log)
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": str(port)}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": str(port),
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             result = cls_api_miner._load_config()
 
         self.assertIsNotNone(result)
-        self.assertEqual(result, ("192.168.1.10", port))
+        self.assertEqual(result, ("192.168.1.10", port, "cg-secret-key"))
 
     # Feature: api-miner, Property 2: Invalid port falls back to default
     # For any non-numeric string, value <= 0, or value > 65535 supplied as
@@ -107,11 +112,15 @@ class TestApiMiner(unittest.TestCase):
     def test_invalid_port_falls_back_to_default(self, raw_port):
         cls_api_miner = api.ApiMiner(self.log)
         stdio = self._capture_log()
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": raw_port}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": raw_port,
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             result = cls_api_miner._load_config()
 
-        self.assertEqual(result, ("192.168.1.10", 4028))
+        self.assertEqual(result, ("192.168.1.10", 4028, "cg-secret-key"))
 
         log_output = stdio.getvalue()
         self.assertIn(raw_port.strip(), log_output)
@@ -121,25 +130,127 @@ class TestApiMiner(unittest.TestCase):
     # Validates: Requirements 1.1, 1.3
     def test_miner_ip_set_port_unset_uses_default(self):
         cls_api_miner = api.ApiMiner(self.log)
-        with patch.dict("os.environ", {"MINER_IP": "192.168.1.10"},
-                        clear=False):
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
             os.environ.pop("MINER_PORT", None)
             result = cls_api_miner._load_config()
 
-        self.assertEqual(result, ("192.168.1.10", 4028))
+        self.assertEqual(result, ("192.168.1.10", 4028, "cg-secret-key"))
 
     # MINER_IP unset/empty -> returns None and logs a missing-config error.
     # Validates: Requirements 1.5
     def test_miner_ip_missing_returns_none_and_logs(self):
         cls_api_miner = api.ApiMiner(self.log)
         stdio = self._capture_log()
-        with patch.dict("os.environ", {"MINER_IP": ""}, clear=False):
+        env = {"MINER_IP": "", "COINGECKO_API_KEY": "cg-secret-key"}
+        with patch.dict("os.environ", env, clear=False):
             result = cls_api_miner._load_config()
 
         self.assertIsNone(result)
 
         log_output = stdio.getvalue()
         self.assertIn("MINER_IP", log_output)
+
+    # COINGECKO_API_KEY present -> returned as the third tuple element.
+    # Validates: Requirements 1.1
+    def test_coingecko_api_key_present_returned_in_config(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            result = cls_api_miner._load_config()
+
+        self.assertEqual(
+            result, ("192.168.1.10", 4028, "cg-secret-key")
+        )
+
+    # COINGECKO_API_KEY present with MINER_PORT unset -> default port used and
+    # the key is still returned as the third tuple element.
+    # Validates: Requirements 1.1, 1.3
+    def test_coingecko_api_key_present_with_default_port(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("MINER_PORT", None)
+            result = cls_api_miner._load_config()
+
+        self.assertEqual(
+            result, ("192.168.1.10", 4028, "cg-secret-key")
+        )
+
+    # COINGECKO_API_KEY unset -> returns None and logs a missing-config error.
+    # Validates: Requirements 1.5
+    def test_coingecko_api_key_unset_returns_none_and_logs(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("COINGECKO_API_KEY", None)
+            result = cls_api_miner._load_config()
+
+        self.assertIsNone(result)
+        self.assertIn("COINGECKO_API_KEY", stdio.getvalue())
+
+    # COINGECKO_API_KEY empty -> returns None and logs a missing-config error.
+    # Validates: Requirements 1.5
+    def test_coingecko_api_key_empty_returns_none_and_logs(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            result = cls_api_miner._load_config()
+
+        self.assertIsNone(result)
+        self.assertIn("COINGECKO_API_KEY", stdio.getvalue())
+
+    # COINGECKO_API_KEY whitespace-only -> treated as missing: returns None and
+    # logs a missing-config error.
+    # Validates: Requirements 1.5
+    def test_coingecko_api_key_whitespace_returns_none_and_logs(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "   ",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            result = cls_api_miner._load_config()
+
+        self.assertIsNone(result)
+        self.assertIn("COINGECKO_API_KEY", stdio.getvalue())
+
+    # COINGECKO_API_KEY is checked before MINER_IP: when the key is missing the
+    # error identifies the key even if MINER_IP is also unset.
+    # Validates: Requirements 1.5
+    def test_coingecko_api_key_missing_takes_precedence_over_miner_ip(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+        env = {"MINER_IP": "", "COINGECKO_API_KEY": ""}
+        with patch.dict("os.environ", env, clear=False):
+            result = cls_api_miner._load_config()
+
+        self.assertIsNone(result)
+        log_output = stdio.getvalue()
+        self.assertIn("COINGECKO_API_KEY", log_output)
+        self.assertNotIn("MINER_IP is not configured", log_output)
 
     # Feature: api-miner, Property 3: Commands serialize to a single line
     # For any JSON-serializable command dict, the serialized payload produced
@@ -203,7 +314,11 @@ class TestApiMiner(unittest.TestCase):
             def close(self):
                 pass
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -291,7 +406,11 @@ class TestApiMiner(unittest.TestCase):
             def close(self):
                 pass
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -365,7 +484,11 @@ class TestApiMiner(unittest.TestCase):
 
         fake_sock = _FakeSocket(outcome)
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -419,7 +542,11 @@ class TestApiMiner(unittest.TestCase):
         cls_api_miner = api.ApiMiner(self.log)
         fake_sock = self._ScriptedSocket([b'{"result": "ok", "n": 42}', b""])
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -458,7 +585,11 @@ class TestApiMiner(unittest.TestCase):
         cls_api_miner = api.ApiMiner(self.log)
         stdio = self._capture_log()
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -479,7 +610,11 @@ class TestApiMiner(unittest.TestCase):
         # The configured timeout budget must be 5 seconds.
         self.assertEqual(api.SOCKET_TIMEOUT, 5)
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -507,7 +642,11 @@ class TestApiMiner(unittest.TestCase):
 
         fake_sock = _TimeoutOnRecvSocket([])
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -529,7 +668,11 @@ class TestApiMiner(unittest.TestCase):
         stdio = self._capture_log()
         fake_sock = self._ScriptedSocket([b""])
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -549,7 +692,11 @@ class TestApiMiner(unittest.TestCase):
         # A single chunk at the cap trips the size-limit branch on first recv.
         fake_sock = self._ScriptedSocket([b"x" * api.MAX_RESPONSE_BYTES])
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -569,7 +716,11 @@ class TestApiMiner(unittest.TestCase):
         raw_text = "this is not json <garbage>"
         fake_sock = self._ScriptedSocket([raw_text.encode("utf-8"), b""])
 
-        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
         with patch.dict("os.environ", env, clear=False):
             with patch(
                 "optimshine.api_miner.socket.create_connection",
@@ -1479,6 +1630,280 @@ class TestApiMiner(unittest.TestCase):
                 # socket factory is ever invoked.
                 mock_send.assert_not_called()
                 mock_conn.assert_not_called()
+
+    # ------------------------------------------------------------------ #
+    # Unit tests for _get_btc_price (CoinGecko simple/price, mocked HTTP). #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _btc_price_response(price=250000.0, last_updated_at=1752710400):
+        """
+        A well-formed CoinGecko simple/price response for bitcoin in PLN.
+        """
+        return {
+            "bitcoin": {
+                "pln": price,
+                "last_updated_at": last_updated_at,
+            }
+        }
+
+    # Success path: the BTC price and last-updated date are returned as a
+    # dict.
+    def test_get_btc_price_success_returns_price_and_date(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        response = self._btc_price_response(
+            price=250000.0, last_updated_at=1752710400
+        )
+
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(
+                cls_api_miner, "api_get_request", return_value=response
+            ) as mock_get:
+                result = cls_api_miner._get_btc_price()
+
+        # last_updated_at 1752710400 == 2025-07-17 00:00:00 UTC.
+        self.assertEqual(result["price"], 250000.0)
+        self.assertEqual(
+            result["date"],
+            datetime.datetime(
+                2025, 7, 17, 0, 0, 0, tzinfo=datetime.timezone.utc
+            ),
+        )
+        self.assertEqual(mock_get.call_count, 1)
+
+    # The CoinGecko API key from the environment is forwarded as the
+    # x-cg-demo-api-key header and the bitcoin/pln price endpoint is queried.
+    def test_get_btc_price_sends_api_key_header_and_pln_query(self):
+        cls_api_miner = api.ApiMiner(self.log)
+
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(
+                cls_api_miner,
+                "api_get_request",
+                return_value=self._btc_price_response(),
+            ) as mock_get:
+                cls_api_miner._get_btc_price()
+
+        mock_get.assert_called_once()
+        args, kwargs = mock_get.call_args
+        url = args[0]
+        self.assertIn("vs_currencies=pln", url)
+        self.assertIn("ids=bitcoin", url)
+        self.assertEqual(
+            kwargs["extra_headers"], {"x-cg-demo-api-key": "cg-secret-key"}
+        )
+
+    # When last_updated_at is absent, the current UTC time is used as the date
+    # while the price is still returned.
+    def test_get_btc_price_missing_last_updated_uses_current_time(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        response = {"bitcoin": {"pln": 123456.0}}
+
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(
+                cls_api_miner, "api_get_request", return_value=response
+            ):
+                result = cls_api_miner._get_btc_price()
+
+        self.assertEqual(result["price"], 123456.0)
+        # A tz-aware UTC datetime is returned even without last_updated_at.
+        self.assertIsInstance(result["date"], datetime.datetime)
+        self.assertEqual(result["date"].tzinfo, datetime.timezone.utc)
+
+    # Missing config (e.g. COINGECKO_API_KEY unset) -> returns None without
+    # querying CoinGecko.
+    def test_get_btc_price_missing_config_returns_none(self):
+        cls_api_miner = api.ApiMiner(self.log)
+
+        env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop("COINGECKO_API_KEY", None)
+            with patch.object(
+                cls_api_miner, "api_get_request"
+            ) as mock_get:
+                result = cls_api_miner._get_btc_price()
+
+        self.assertIsNone(result)
+        mock_get.assert_not_called()
+
+    # No response from CoinGecko (None) -> None and a warning is logged.
+    def test_get_btc_price_no_response_returns_none_and_warns(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(
+                cls_api_miner, "api_get_request", return_value=None
+            ):
+                result = cls_api_miner._get_btc_price()
+
+        self.assertIsNone(result)
+        self.assertIn("BTC price is not available!", stdio.getvalue())
+
+    # Unexpected response shape (missing bitcoin/pln keys) -> None and a
+    # warning is logged.
+    def test_get_btc_price_unexpected_shape_returns_none_and_warns(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(
+                cls_api_miner,
+                "api_get_request",
+                return_value={"unexpected": "payload"},
+            ):
+                result = cls_api_miner._get_btc_price()
+
+        self.assertIsNone(result)
+        self.assertIn("BTC price is not available!", stdio.getvalue())
+
+    # Null price value -> None and a warning is logged.
+    def test_get_btc_price_null_price_returns_none_and_warns(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+        response = {"bitcoin": {"pln": None, "last_updated_at": 1752710400}}
+
+        env = {
+            "MINER_IP": "192.168.1.10",
+            "MINER_PORT": "4028",
+            "COINGECKO_API_KEY": "cg-secret-key",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(
+                cls_api_miner, "api_get_request", return_value=response
+            ):
+                result = cls_api_miner._get_btc_price()
+
+        self.assertIsNone(result)
+        self.assertIn("BTC price is not available!", stdio.getvalue())
+
+    # ------------------------------------------------------------------ #
+    # Unit tests for get_current_miner_profitability (mocked BTC price).  #
+    # ------------------------------------------------------------------ #
+
+    # Success path: returns True and stores profitability per kWh on
+    # self.profitability as (daily_btc_profit * btc_price) /
+    # daily_kwh_consumption for each valid mode.
+    def test_get_current_miner_profitability_success(self):
+        btc_price = {
+            "date": datetime.datetime(
+                2025, 7, 17, tzinfo=datetime.timezone.utc
+            ),
+            "price": 250000.0,
+        }
+
+        for mode in ("Eco", "Standard", "Super"):
+            with self.subTest(mode=mode):
+                cls_api_miner = api.ApiMiner(self.log)
+                expected = (
+                    api.WORKMODE_AVERAGE_PROFITABILITY[mode]
+                    * btc_price["price"]
+                    / api.WORKMODE_POWER_CONSUMPTION[mode]
+                )
+                with patch.object(
+                    cls_api_miner, "_get_btc_price", return_value=btc_price
+                ) as mock_price:
+                    result = cls_api_miner.get_current_miner_profitability(
+                        mode
+                    )
+
+                self.assertTrue(result)
+                self.assertAlmostEqual(cls_api_miner.profitability, expected)
+                mock_price.assert_called_once()
+
+    # Invalid mode -> False, an error is logged, no profitability is stored,
+    # and the BTC price is never fetched.
+    def test_get_current_miner_profitability_invalid_mode(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+
+        for mode in ("Turbo", "", None, 123):
+            with self.subTest(mode=mode):
+                with patch.object(
+                    cls_api_miner, "_get_btc_price"
+                ) as mock_price:
+                    result = cls_api_miner.get_current_miner_profitability(
+                        mode
+                    )
+
+                self.assertFalse(result)
+                mock_price.assert_not_called()
+
+        self.assertFalse(hasattr(cls_api_miner, "profitability"))
+        self.assertIn("Unknown Avalon Q operating mode", stdio.getvalue())
+
+    # BTC price unavailable -> False, an error is logged, and no profitability
+    # is stored.
+    def test_get_current_miner_profitability_no_btc_price(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stdio = self._capture_log()
+
+        with patch.object(
+            cls_api_miner, "_get_btc_price", return_value=None
+        ):
+            result = cls_api_miner.get_current_miner_profitability("Eco")
+
+        self.assertFalse(result)
+        self.assertFalse(hasattr(cls_api_miner, "profitability"))
+        self.assertIn(
+            "Cannot compute miner profitability!", stdio.getvalue()
+        )
+
+    # Higher BTC price yields proportionally higher profitability for the same
+    # mode.
+    def test_get_current_miner_profitability_scales_with_price(self):
+        def _price(value):
+            return {
+                "date": datetime.datetime(
+                    2025, 7, 17, tzinfo=datetime.timezone.utc
+                ),
+                "price": value,
+            }
+
+        cls_low = api.ApiMiner(self.log)
+        with patch.object(
+            cls_low, "_get_btc_price", return_value=_price(100000.0)
+        ):
+            self.assertTrue(
+                cls_low.get_current_miner_profitability("Standard")
+            )
+
+        cls_high = api.ApiMiner(self.log)
+        with patch.object(
+            cls_high, "_get_btc_price", return_value=_price(200000.0)
+        ):
+            self.assertTrue(
+                cls_high.get_current_miner_profitability("Standard")
+            )
+
+        self.assertAlmostEqual(
+            cls_high.profitability, cls_low.profitability * 2
+        )
 
 
 # ---------------------------------------------------------------------- #

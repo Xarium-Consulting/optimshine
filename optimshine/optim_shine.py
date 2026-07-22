@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from optimshine.api_shine import ApiShine
 from optimshine.api_weather import ApiWeather
 from optimshine.api_pse import ApiPse
+from optimshine.api_miner import ApiMiner, WORKMODE_MAP
 from optimshine.optim_config import OptimConfig
 
 
@@ -27,7 +28,7 @@ CHARGE_MODES = {
 }
 
 
-class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
+class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
     """
     OptimShine is a class that manages the optimization of battery charging
     based on various factors such as weather conditions, plant data, and
@@ -128,7 +129,119 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
 
         return True
 
-    def _get_judge_factors(self):
+    def _check_current_weather(self, date, time):
+        """
+        """
+        self.cloudy_now = False
+
+        if not hasattr(self, "weather_data"):
+            self.log.error("No weather data available!")
+            return False
+
+        hour_ts = self.get_timestamp_hour(date, time)
+        sample_number = (
+            int((hour_ts - self.weather_data["first_sample_time"])
+                / self.weather_data["interval"])
+            )
+        if sample_number >= len(self.weather_data["low_clouds_data"]):
+            self.log.error("Sample number out of range")
+            return False
+
+        if self.weather_data["low_clouds_data"][sample_number] > 0.75:
+            self.cloudy_now = True
+            return True
+
+        return True
+
+    def _get_current_judge_factors(self, inverter):
+        """
+        Gathers the current factors used to judge the optimization strategy.
+
+        Collects the current battery state of charge, PV production, whether
+        the next hour is expected to be cloudy, the current RCE price, and the
+        miner profitability per operating mode. The gathered values are stored
+        on the instance:
+
+            - self.current_soc: battery state of charge (float, %)
+            - self.current_pv_power: PV production (float, W)
+            - self.if_night / self.not_cloudy_now: weather flags
+            - self.current_rce_price: current quarter RCE price
+            - self.miner_profitability: {mode: PLN/kWh} for each mode
+
+        Args:
+            inverter (str): The serial number of the inverter to read the SoC
+                            and PV production from.
+
+        Returns:
+            bool: True if all factors were gathered successfully, False
+                  otherwise.
+        """
+        self.if_night = False
+        self.current_rce_price = None
+
+        if not hasattr(self, "weather_data"):
+            self.log.error("No weather data available!")
+            return False
+
+        if not hasattr(self, "rce_prices"):
+            self.log.error("No RCE prices available!")
+            return False
+
+        time_now = datetime.now().timestamp()
+        self.log.debug("Checking if token is valid")
+        if self.token_ttl < time_now and not self.login_shine():
+            self.log.error("Authorization token has expired. "
+                           "Failed to login to Shine API")
+            return False
+
+        date_now = datetime.now()
+        date = date_now.strftime("%Y-%m-%d")
+        time = date_now.strftime("%I:%M:%S %p")
+        date_ts = date_now.timestamp()
+        quarter_ts = self.get_timestamp_quarter(date, time)
+
+        if (self.weather_data["sunrise_time"] > date_ts
+                or self.weather_data["sunset_time"] < date_ts):
+            self.if_night = True
+        elif not self._check_current_weather(date, time):
+            self.log.error("Checking current weather failed!")
+            return False
+
+        try:
+            self.current_rce_price = self.rce_prices[quarter_ts]/1000
+        except KeyError:
+            self.log.error("Current quarter not found in RCE prices")
+            return False
+
+        self.log.debug("Getting battery state of charge")
+        if not self.get_device_value(inverter, "battery_soc"):
+            self.log.error("Getting battery state of charge failed")
+            return False
+        self.current_soc = float(self.device_value)
+        self.device_value = None
+        self.log.debug(f"Battery SOC: {self.current_soc}%")
+
+        self.log.debug("Getting PV production")
+        if not self.get_device_value(inverter, "pv_power"):
+            self.log.error("Getting PV production failed")
+            return False
+        self.current_pv_power = float(self.device_value)
+        self.device_value = None
+        self.log.debug(f"PV production: {self.current_pv_power} W")
+
+        self.log.debug("Getting miner profitability")
+        self.miner_profitability = {}
+        for mode in WORKMODE_MAP:
+            if not self.get_current_miner_profitability(mode):
+                self.log.error("Getting miner profitability failed")
+                return False
+            self.miner_profitability[mode] = self.profitability
+        self.log.debug(f"Miner profitability: {self.miner_profitability}")
+
+        self.log.info("Successfully obtained current judge factors")
+        return True
+
+    def _get_daily_judge_factors(self):
         """
         Retrieves judge factors based on plant information and weather data and
         RCE energy prices.
@@ -159,13 +272,7 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
         self.min_price = next(iter(self.rce_prices.values()))
         for quarter, price in self.rce_prices.items():
             if price < self.min_price:
-                time = datetime.strptime(quarter, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=ZoneInfo("Europe/Warsaw")
-                ).astimezone(ZoneInfo("UTC"))
-                self.min_price_timestamp = self.get_timestamp_hour(
-                    time.strftime("%Y-%m-%d"),
-                    time.strftime("%I:%M:%S %p")
-                )
+                self.min_price_timestamp = quarter
                 self.min_price = price
 
         self.log.debug(f"min_price_timestamp: {self.min_price_timestamp}")
@@ -396,9 +503,9 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
                           strategy setup fails.
         """
         self.log.info("Getting weather data and energy prices")
-        if not self._get_judge_factors():
+        if not self._get_daily_judge_factors():
             self.log.warning("Failed to get judge factors")
-            self.judge_date += timedelta(minutes=30)
+            self.judge_date += timedelta(minutes=15)
             self.log.info(
                 "Rescheduling optimization judge to "
                 f"{self.judge_date.strftime('%d-%m-%Y %H:%M')}"

@@ -5,6 +5,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from logging import RootLogger
 from optimshine.api_common import ApiCommon
 
@@ -50,7 +53,10 @@ class ApiPse(ApiCommon):
 
         self.rce_date = date
         self.rce_prices = {
-            quarter["dtime"]: quarter["rce_pln"] for quarter in response_data
+            datetime.strptime(quarter["dtime"], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=ZoneInfo("Europe/Warsaw")
+                ).astimezone(ZoneInfo("UTC")).timestamp(): quarter["rce_pln"]
+            for quarter in response_data
         }
 
         self.log.info(f"Successfully obtained RCE data for {self.rce_date}.")

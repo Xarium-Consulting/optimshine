@@ -8,6 +8,7 @@
 import os
 import socket
 import json
+import datetime
 
 from logging import RootLogger
 from optimshine.api_common import ApiCommon
@@ -22,6 +23,18 @@ WORKMODE_MAP = {
     "Eco": 0,
     "Standard": 1,
     "Super": 2,
+}
+
+WORKMODE_POWER_CONSUMPTION = {
+    "Eco": (0.8*24),
+    "Standard": (1.35*24),
+    "Super": (1.6*24),
+}
+
+WORKMODE_AVERAGE_PROFITABILITY = {
+    "Eco": 0.000026,
+    "Standard": 0.0000365,
+    "Super": 0.000043,
 }
 
 # ascset payloads for enabling / disabling hashing
@@ -53,9 +66,17 @@ class ApiMiner(ApiCommon):
         Read the miner connection settings from the environment.
 
         Returns:
-            tuple or None: An (ip, port) tuple when MINER_IP is configured,
-                           otherwise None.
+            tuple or None: An (ip, port, coingecko_api_key) tuple when MINER_IP
+                           and COINGECKO_API_KEY is configured, otherwise None.
         """
+        coingecko_api_key = os.environ.get("COINGECKO_API_KEY")
+        if not coingecko_api_key or not coingecko_api_key.strip():
+            self.log.error(
+                "COINGECKO_API_KEY is not configured! Set COINGECKO_API_KEY "
+                "in the environment."
+            )
+            return None
+
         ip = os.environ.get("MINER_IP")
         if not ip or not ip.strip():
             self.log.error(
@@ -66,7 +87,7 @@ class ApiMiner(ApiCommon):
 
         port_value = os.environ.get("MINER_PORT")
         if not port_value or not port_value.strip():
-            return (ip, DEFAULT_PORT)
+            return (ip, DEFAULT_PORT, coingecko_api_key)
 
         port_value = port_value.strip()
         try:
@@ -76,16 +97,16 @@ class ApiMiner(ApiCommon):
                 f"Invalid MINER_PORT '{port_value}'! Falling back to "
                 f"{DEFAULT_PORT}."
             )
-            return (ip, DEFAULT_PORT)
+            return (ip, DEFAULT_PORT, coingecko_api_key)
 
         if 1 <= port <= 65535:
-            return (ip, port)
+            return (ip, port, coingecko_api_key)
 
         self.log.error(
             f"Invalid MINER_PORT '{port_value}'! Falling back to "
             f"{DEFAULT_PORT}."
         )
-        return (ip, DEFAULT_PORT)
+        return (ip, DEFAULT_PORT, coingecko_api_key)
 
     def _send_command(self, command):
         """
@@ -102,7 +123,7 @@ class ApiMiner(ApiCommon):
         config = self._load_config()
         if config is None:
             return None
-        ip, port = config
+        ip, port, _coingecko_api_key = config
 
         payload = json.dumps(command) + "\n"
 
@@ -390,4 +411,126 @@ class ApiMiner(ApiCommon):
             )
             return False
 
+        return True
+
+    def _get_btc_price(self):
+        """
+        Retrieve the latest BTC price in PLN from the CoinGecko API.
+
+        Reads the CoinGecko API key from the environment (via the shared
+        connection config) and queries the ``simple/price`` endpoint for the
+        Bitcoin price in PLN.
+
+        Returns:
+            dict or None: A dict with the ``price`` (in PLN) and the ``date``
+                          the price was last updated when the price is
+                          available, otherwise None. When the price is
+                          unavailable a warning is logged.
+        """
+        self.log.info("Getting the latest BTC price in PLN.")
+
+        config = self._load_config()
+        if config is None:
+            return None
+        _ip, _port, coingecko_api_key = config
+
+        price_url = (
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin&vs_currencies=pln&include_last_updated_at=true"
+        )
+        extra_headers = {"x-cg-demo-api-key": coingecko_api_key}
+
+        data = self.api_get_request(
+            price_url,
+            extra_headers=extra_headers,
+        )
+        if not data:
+            self.log.warning(
+                "BTC price is not available! No response was returned by "
+                "CoinGecko."
+            )
+            return None
+
+        try:
+            bitcoin = data["bitcoin"]
+            price = bitcoin["pln"]
+        except (TypeError, KeyError):
+            self.log.warning(
+                f"BTC price is not available! Unexpected CoinGecko response: "
+                f"{data}"
+            )
+            return None
+
+        if price is None:
+            self.log.warning(
+                f"BTC price is not available! CoinGecko returned no price: "
+                f"{data}"
+            )
+            return None
+
+        # last_updated_at is a UNIX timestamp (UTC). Fall back to now when the
+        # field is absent so the returned record always carries a date.
+        last_updated_at = bitcoin.get("last_updated_at")
+        if last_updated_at is not None:
+            date = datetime.datetime.fromtimestamp(
+                last_updated_at, tz=datetime.timezone.utc
+            )
+        else:
+            date = datetime.datetime.now(
+                tz=datetime.timezone.utc
+            )
+
+        btc_price = {"date": date, "price": price}
+        self.log.info(f"BTC price obtained successfully: {btc_price}")
+        return btc_price
+
+    def get_current_miner_profitability(self, mode):
+        """
+        Estimate the miner profitability per kWh for a given operating mode.
+
+        Combines the current BTC price in PLN with the average daily
+        profitability (BTC per 24h) and power consumption (kWh per 24h) of the
+        requested operating mode to compute how much PLN the miner earns for
+        each kWh of energy it consumes:
+
+            profitability_per_kwh =
+                (daily_btc_profit * btc_price_pln) / daily_kwh_consumption
+
+        Args:
+            mode (str): The operating mode, one of Eco, Standard, or Super.
+
+        On success the profitability in PLN per kWh is stored on
+        ``self.profitability``.
+
+        Returns:
+            bool: True when the profitability was computed and stored, False
+                  otherwise.
+        """
+        try:
+            # Power consumption and profitability per 24h
+            mode_profit = WORKMODE_AVERAGE_PROFITABILITY[mode]
+            mode_consumption = WORKMODE_POWER_CONSUMPTION[mode]
+        except KeyError:
+            self.log.error(
+                f"Unknown Avalon Q operating mode '{mode}'! Expected one of "
+                f"{sorted(WORKMODE_MAP)}."
+            )
+            return False
+
+        btc_price = self._get_btc_price()
+        if btc_price is None:
+            self.log.error(
+                "Cannot compute miner profitability! The BTC price is not "
+                "available."
+            )
+            return False
+
+        # daily revenue (PLN) earned per kWh of energy consumed per 24h.
+        daily_revenue_pln = mode_profit * btc_price["price"]
+        self.profitability = daily_revenue_pln / mode_consumption
+
+        self.log.info(
+            f"Avalon Q '{mode}' profitability: "
+            f"{self.profitability} PLN/kWh."
+        )
         return True

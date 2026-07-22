@@ -751,6 +751,18 @@ class TestApiShine(unittest.TestCase):
         self.assertEqual(hasattr(cls_api_shine, "device_value"), True)
         self.assertEqual(cls_api_shine.device_value, 68)
 
+    @patch("optimshine.api_common.ApiCommon.api_post_request")
+    def test_get_device_value_pv_power_pass(self, mock_api_post_request):
+        mock_api_post_request.return_value = {"data": {"pvTotalPower": 1543}}
+
+        cls_api_shine = api.ApiShine(self.log)
+        cls_api_shine.token = "test"
+        result = cls_api_shine.get_device_value("test", "pv_power")
+
+        self.assertTrue(result)
+        self.assertEqual(hasattr(cls_api_shine, "device_value"), True)
+        self.assertEqual(cls_api_shine.device_value, 1543)
+
 
 if __name__ == "__main__":
     unittest.main()

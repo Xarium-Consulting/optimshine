@@ -42,6 +42,28 @@ class ApiWeather(ApiCommon):
                                tzinfo=ZoneInfo("UTC"))
         return int(hour.timestamp())
 
+    def get_timestamp_quarter(self, date, time):
+        """
+        Convert a given date and time into a UTC timestamp representing
+        the start of the quarter (15-minute interval).
+
+        Args:
+            date (str): The date in the format 'YYYY-MM-DD'.
+            time (str): The time in the format 'HH:MM:SS AM/PM'.
+
+        Returns:
+            int: The UTC timestamp corresponding to the start of the quarter.
+        """
+        dt_time = datetime.datetime.strptime(
+            f"{date} {time}",
+            "%Y-%m-%d %I:%M:%S %p",
+        )
+        quarter = dt_time.replace(minute=0, second=0, microsecond=0)
+        quarter += datetime.timedelta(
+            minutes=15 * (dt_time.minute // 15)
+        )
+        return int(quarter.timestamp())
+
     def _get_solar_sunrise_sunset_time(self, latitude, longitude, date):
         """
         Retrieves the sunrise and sunset times for a given location and date.
