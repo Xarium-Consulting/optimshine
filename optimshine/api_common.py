@@ -9,12 +9,15 @@ import datetime
 import requests
 
 from logging import RootLogger
+from zoneinfo import ZoneInfo
 
 HEADERS = {
     "Content-Type": "application/json",
     "lang": "en_US",
     "User-Agent": "Mozilla/5.0"
 }
+
+MARKET_TIMEZONE = ZoneInfo("Europe/Warsaw")
 
 
 class ApiCommon:
@@ -23,6 +26,12 @@ class ApiCommon:
     GET requests.
     """
     def __init__(self, log: RootLogger):
+        """
+        Initialize the API client.
+
+        Args:
+            log (RootLogger): The logger used for all logging.
+        """
         self.log = log
 
     def api_post_request(self, api_url, request, token=None):

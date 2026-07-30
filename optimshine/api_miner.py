@@ -17,6 +17,7 @@ DEFAULT_PORT = 4028
 SOCKET_TIMEOUT = 5          # seconds, total connect + exchange budget
 MAX_RESPONSE_BYTES = 65536  # response size cap
 RECV_CHUNK = 4096           # per-recv read size
+BTC_PRICE_CACHE_TTL = 300  # seconds
 
 # Operating mode -> CGMiner workmode integer (three distinct values)
 WORKMODE_MAP = {
@@ -162,7 +163,10 @@ class ApiMiner(ApiCommon):
             )
             return None
         finally:
-            if sock is not None:
+            # Defensive guard: sock is only left as None when
+            # create_connection raises, and both handlers for that return
+            # before reaching here, so the None case never occurs in practice.
+            if sock is not None:  # pragma: no branch
                 sock.close()
 
         if not raw:
@@ -256,7 +260,10 @@ class ApiMiner(ApiCommon):
         # cgminer firmware (e.g. 4.11.1) reports the hash rate here but not a
         # Temperature field, so only the hash rate is required.
         summary = None
-        if isinstance(response, dict):
+        # Defensive guard: _status_ok already rejected any non-dict response
+        # above, so this is always True here. It is kept so summary() does not
+        # depend on that behaviour of _status_ok.
+        if isinstance(response, dict):  # pragma: no branch
             section = response.get("SUMMARY")
             if isinstance(section, list) and section:
                 element = section[0]
@@ -443,11 +450,52 @@ class ApiMiner(ApiCommon):
 
     def _get_btc_price(self):
         """
+        Return the current BTC price in PLN, reusing a recently fetched value.
+
+        Wraps ``_fetch_btc_price`` with a short lived cache so that a single
+        optimization pass, which evaluates every operating mode for every
+        inverter, issues one CoinGecko request instead of one per evaluation.
+        The cached value is reused for ``BTC_PRICE_CACHE_TTL`` seconds. Failed
+        fetches are not cached, so a transient error is retried on the next
+        call.
+
+        Returns:
+            dict or None: A dict with the ``price`` (in PLN) and the ``date``
+                          the price was last updated when the price is
+                          available, otherwise None.
+        """
+        # ApiMiner.__init__ is not called when this class is mixed into
+        # OptimShine, so the cache state is read with defaults instead of being
+        # initialized up front.
+        cached = getattr(self, "_btc_price_cache", None)
+        cached_at = getattr(self, "_btc_price_cached_at", None)
+        now = datetime.datetime.now().timestamp()
+
+        if cached is not None and cached_at is not None:
+            age = now - cached_at
+            if 0 <= age < BTC_PRICE_CACHE_TTL:
+                self.log.debug(
+                    f"Reusing BTC price cached {age:.0f}s ago: {cached}"
+                )
+                return cached
+
+        btc_price = self._fetch_btc_price()
+        if btc_price is None:
+            # Do not cache failures; the next call retries.
+            return None
+
+        self._btc_price_cache = btc_price
+        self._btc_price_cached_at = now
+        return btc_price
+
+    def _fetch_btc_price(self):
+        """
         Retrieve the latest BTC price in PLN from the CoinGecko API.
 
         Reads the CoinGecko API key from the environment (via the shared
         connection config) and queries the ``simple/price`` endpoint for the
-        Bitcoin price in PLN.
+        Bitcoin price in PLN. This always performs a request; callers should
+        normally use ``_get_btc_price``, which caches the result.
 
         Returns:
             dict or None: A dict with the ``price`` (in PLN) and the ``date``

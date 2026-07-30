@@ -10,9 +10,10 @@ import sys
 import time
 import sdnotify
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from optimshine.api_common import MARKET_TIMEZONE
 from optimshine.api_shine import ApiShine
 from optimshine.api_weather import ApiWeather
 from optimshine.api_pse import ApiPse
@@ -36,6 +37,17 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
     pricing information.
     """
     def __init__(self, envpath='.env'):
+        """
+        Initializes the OptimShine instance.
+
+        Notifies systemd that the service is ready, sets up the logger, loads
+        the environment variables from the given env file and initializes the
+        job scheduler.
+
+        Args:
+            envpath (str, optional): Path to the env file with the
+                                     configuration. Defaults to '.env'.
+        """
         self.judge_date: datetime = None
         self.soc_check_date: datetime = None
         self.optim = False
@@ -133,6 +145,19 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
 
     def _check_current_weather(self, date, time):
         """
+        Checks whether it is cloudy at the given date and time.
+
+        Picks the low clouds forecast sample that matches the requested hour
+        and sets ``self.cloudy_now`` to True when the cloud cover exceeds 75%.
+
+        Args:
+            date (str): The date to check, in YYYY-MM-DD format.
+            time (str): The time to check, in "%I:%M:%S %p" format.
+
+        Returns:
+            bool: True if the current weather was determined, False when no
+                  weather data is available or the requested hour is outside
+                  the forecast range.
         """
         self.cloudy_now = False
 
@@ -157,18 +182,17 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
 
     def _get_current_judge_factors(self):
         """
-        Gathers the current factors used to judge the optimization strategy.
+        Gathers the plant-wide factors used to judge the optimization strategy.
 
-        Collects the current battery state of charge, PV production, whether
-        the next hour is expected to be cloudy, the current RCE price, and the
-        miner profitability per operating mode. The gathered values are stored
-        on the instance:
+        Collects whether it is night, whether it is cloudy right now, the
+        current quarter RCE price, and the miner profitability per operating
+        mode. The gathered values are stored on the instance:
 
-            - self.current_soc: battery state of charge (float, %)
-            - self.current_pv_power: PV production (float, W)
-            - self.if_night / self.not_cloudy_now: weather flags
-            - self.current_rce_price: current quarter RCE price
-            - self.miner_profitability: {mode: PLN/kWh} for each mode
+            - self.if_night: True when the sun is below the horizon
+            - self.cloudy_now: set by ``_check_current_weather``
+            - self.current_rce_price: current quarter RCE price (PLN/kWh)
+            - self.miner_profitability: {mode: PLN/kWh} for each mode, the
+              single source of truth consumed by ``_compare_miner_to_pse``
 
         Returns:
             bool: True if all factors were gathered successfully, False
@@ -192,21 +216,30 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                            "Failed to login to Shine API")
             return False
 
-        date_now = datetime.now()
-        date = date_now.strftime("%Y-%m-%d")
-        time = date_now.strftime("%I:%M:%S %p")
+        # The two lookups below are indexed on different clocks., so each gets
+        # the wall clock it expects instead of the host's local one:
+        #   - RCE quarters are settled on market local time.
+        #   - Weather samples are keyed by get_timestamp_hour, which resolves
+        #     in UTC, matching the forecast timestamps.
+        date_now = datetime.now(tz=timezone.utc)
+        market_now = date_now.astimezone(MARKET_TIMEZONE)
+        market_date = market_now.strftime("%Y-%m-%d")
+        market_time = market_now.strftime("%I:%M:%S %p")
+        utc_date = date_now.strftime("%Y-%m-%d")
+        utc_time = date_now.strftime("%I:%M:%S %p")
         date_ts = date_now.timestamp()
-        quarter_ts = self.get_timestamp_quarter(date, time)
+        quarter_ts = self.get_timestamp_quarter(market_date, market_time)
 
         if (self.weather_data["sunrise_time"] > date_ts
                 or self.weather_data["sunset_time"] < date_ts):
             self.if_night = True
-        elif not self._check_current_weather(date, time):
+        elif not self._check_current_weather(utc_date, utc_time):
             self.log.error("Checking current weather failed!")
             return False
 
         try:
             self.current_rce_price = self.rce_prices[quarter_ts]/1000
+            self.log.debug(f"Current PSE price: {self.current_rce_price}")
         except KeyError:
             self.log.error("Current quarter not found in RCE prices")
             return False
@@ -236,7 +269,9 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
             self.log.error("No plant info available")
             return False
 
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = datetime.now(tz=timezone.utc).astimezone(
+            MARKET_TIMEZONE
+        ).strftime("%Y-%m-%d")
 
         self.log.debug("Trying to get weather data")
         if not self._check_weather(self.plant["latitude"],
@@ -265,6 +300,20 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
 
     def _get_inverter_judge_factors(self, inverter, night=False):
         """
+        Reads the per-inverter factors used to judge the optimization strategy.
+
+        Always reads the battery state of charge. The PV production is read
+        only during the day, since it is always zero at night.
+
+        Args:
+            inverter (object): The inverter to read the values from.
+            night (bool, optional): When True the PV production read is
+                                    skipped. Defaults to False.
+
+        Returns:
+            tuple: ``(state_of_charge, pv_production)`` on success. The PV
+                   production is None when ``night`` is True. Returns
+                   ``(None, None)`` when reading a value failed.
         """
         self.log.debug("Getting battery state of charge")
         if not self.get_device_value(inverter, "battery_soc"):
@@ -292,40 +341,44 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
         profitability for each operating mode and decides which use of the
         energy is more valuable.
 
-        For every mode in WORKMODE_MAP the current profitability (PLN/kWh) is
-        obtained via ``get_current_miner_profitability`` and compared to the
-        current PSE price. The mode with the highest profitability is selected;
-        if that profitability beats the PSE price the mode wins, otherwise
-        selling to the grid (PSE) wins.
+        Reads the per-mode profitability (PLN/kWh) gathered by
+        ``_get_current_judge_factors`` into ``self.miner_profitability`` and
+        compares each mode to the current PSE price. Among the modes that beat
+        the PSE price the least profitable one is chosen, so the miner runs in
+        the most conservative mode that is still worth running. When no mode
+        beats the PSE price, selling to the grid (PSE) wins.
+
+        ``_get_current_judge_factors`` must have run successfully first, since
+        it provides both the PSE price and the profitability figures.
 
         Returns:
             str or None: The operating mode when the miner is more profitable,
                          the string ``"pse"`` when the PSE price is better, or
-                         None if the current PSE price is unavailable or the
-                         profitability could not be computed.
+                         None if the current PSE price or the profitability
+                         figures are unavailable.
         """
         if not hasattr(self, "current_rce_price") or \
                 self.current_rce_price is None:
             self.log.error("No current PSE price available!")
             return None
 
+        if not getattr(self, "miner_profitability", None):
+            self.log.error("No miner profitability available!")
+            return None
+
         chosen_mode = None
         chosen_profitability = None
-        for mode in WORKMODE_MAP:
-            if not self.get_current_miner_profitability(mode):
-                self.log.error("Getting miner profitability failed")
-                return None
-
+        for mode, profitability in self.miner_profitability.items():
             self.log.debug(
-                f"'{mode}' profitability: {self.profitability} PLN/kWh, "
+                f"'{mode}' profitability: {profitability} PLN/kWh, "
                 f"current PSE price: {self.current_rce_price} PLN/kWh"
             )
 
-            if self.profitability > self.current_rce_price and (
+            if profitability > self.current_rce_price and (
                 chosen_profitability is None
-                or self.profitability < chosen_profitability
+                or profitability < chosen_profitability
             ):
-                chosen_profitability = self.profitability
+                chosen_profitability = profitability
                 chosen_mode = mode
 
         if chosen_mode is not None:
@@ -444,6 +497,19 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
     def optim_strategy_night(self):
         """
         Sets up the optimization strategy for nighttime.
+
+        Hands over to the day strategy when the sun is already up. Otherwise it
+        reads the battery state of charge of every inverter and either stops
+        mining (state of charge at or below 35%) or mines in Eco mode. The next
+        night optimization run is scheduled 15 minutes ahead.
+
+        Returns:
+            bool: True when the day strategy was scheduled instead. None is
+                  returned after a regular night optimization pass.
+
+        Raises:
+            RuntimeError: If the inverter list or the weather data is missing,
+                          or if reading the inverter values failed.
         """
         if not hasattr(self, "inverters") or not self.inverters:
             self.log.error("No inverter list found")
@@ -507,16 +573,33 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
 
     def optim_strategy_day(self):
         """
-        Determines and sets the optimization strategy for battery charging
-        based on various conditions such as optimization status, dates,
-        minimum price, and inverter availability. It schedules jobs for
-        optimizing state of charge (SOC) checks and battery charging based
-        on the current time and weather data.
+        Determines and applies the daytime optimization strategy.
+
+        Hands over to the night strategy after sunset. Otherwise, for every
+        inverter, it combines the current RCE price, the cloud cover, the
+        battery state of charge and the PV production to decide the battery
+        charge mode and whether the miner should run, and in which mode:
+
+            - negative RCE price: fast charge and mine in Super mode
+            - cloudy, low battery: fast charge, miner off
+            - cloudy, full battery: mine when it beats the PSE price and the PV
+              production covers a mode, otherwise sell the energy
+            - sunny, low battery: fast charge, miner off
+            - sunny, high RCE price: no charge, miner off
+            - sunny otherwise: slow charge (fast charge close to sunset) and
+              mine when it beats the PSE price and PV production allows it
+
+        The next day optimization run is scheduled 15 minutes ahead.
 
         Returns:
-            bool: True if the optimization strategy was set successfully or
-                  if optimization is not needed, False if there are issues
-                  with the optimization parameters.
+            bool: True when the night strategy was scheduled instead or when a
+                  negative price pass finished early. None is returned after a
+                  regular day optimization pass.
+
+        Raises:
+            RuntimeError: If the inverter list, the weather data or the daily
+                          weather info is missing, or if getting the judge
+                          factors or the inverter values failed.
         """
         if not hasattr(self, "inverters") or not self.inverters:
             self.log.error("No inverter list found")
@@ -602,7 +685,7 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                         self.log.info("Charging battery and selling energy")
                         self.off()
                     elif consumption_mode == "TOO_LOW":
-                        self.log.info("To low production to mine, charging "
+                        self.log.info("Too low production to mine, charging "
                                       "battery and selling energy")
                         self.off()
                     else:
@@ -618,7 +701,8 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                     self.off()
                 elif self.weather_data["sunset_time"] > buffor_time:
                     if self.current_rce_price > 0.6:
-                        self.log.info("Sunny weather. High PSE price.")
+                        self.log.info("Sunny weather. High PSE price:"
+                                      f" {self.current_rce_price}")
                         self.optim_charge_battery(inverter, "no_charge")
                         self.off()
                     else:
@@ -633,8 +717,9 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                                           " energy")
                             self.off()
                         elif consumption_mode == "TOO_LOW":
-                            self.log.info("To low production to mine, charging"
-                                          " battery and selling energy")
+                            self.log.info("Too low production to mine, "
+                                          "charging battery and selling "
+                                          "energy")
                             self.off()
                         else:
                             self.log.info(f"Mining in {consumption_mode} mode")
@@ -654,7 +739,7 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                                       " energy")
                         self.off()
                     elif consumption_mode == "TOO_LOW":
-                        self.log.info("To low production to mine, charging"
+                        self.log.info("Too low production to mine, charging"
                                       " battery and selling energy")
                         self.off()
                     else:
@@ -679,9 +764,13 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
         Evaluates weather data and energy prices to determine
         the optimization strategy.
 
+        Gets the daily judge factors and starts either the day or the night
+        strategy depending on whether the judge ran before sunset. Tomorrow's
+        judge is then scheduled based on tomorrow's sunrise time. When getting
+        the judge factors fails, the judge is rescheduled 30 minutes ahead.
+
         Raises:
-            RuntimeError: If judge factors retrieval or optimization
-                          strategy setup fails.
+            RuntimeError: If judge factors retrieval fails.
         """
         self.log.info("Getting weather data and energy prices")
         if not self._get_daily_judge_factors():
@@ -740,6 +829,10 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
     def optim_main(self):
         """
         Main function to set up and schedule the optimization judge.
+
+        Sets up the Shine API connection, schedules the first optimization
+        judge one minute ahead and starts the scheduler. Keeps notifying the
+        systemd watchdog while there are scheduled or running jobs.
 
         Raises:
             SystemExit: Exits the program if no jobs are scheduled.

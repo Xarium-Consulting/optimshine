@@ -44,6 +44,25 @@ class TestApiShine(unittest.TestCase):
         self.assertEqual(response, {"data": "Success"})
 
     @patch("requests.post")
+    def test_api_post_request_no_token(self, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"data": "Success"}
+
+        cls_common_api = api.ApiCommon(self.log)
+        response = cls_common_api.api_post_request(
+            "test_url",
+            {"test_request": "request"},
+        )
+
+        self.assertEqual(response, {"data": "Success"})
+        # Without a token no Authorization header is added.
+        mock_post.assert_called_once_with(
+            "test_url",
+            json={"test_request": "request"},
+            headers=api.HEADERS,
+        )
+
+    @patch("requests.post")
     def test_api_post_request_wrong_json_response(self, mock_post):
         stdio = io.StringIO()
         mock_post.return_value.status_code = 200
@@ -95,6 +114,25 @@ class TestApiShine(unittest.TestCase):
         cls_common_api = api.ApiCommon(self.log)
         response = cls_common_api.api_get_request("test_url")
         self.assertEqual(response, {"data": "Success"})
+
+    @patch("requests.get")
+    def test_api_get_request_extra_headers(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {"data": "Success"}
+
+        cls_common_api = api.ApiCommon(self.log)
+        response = cls_common_api.api_get_request(
+            "test_url",
+            extra_headers={"x-cg-demo-api-key": "cg-test-key"},
+        )
+
+        self.assertEqual(response, {"data": "Success"})
+        # The extra header is merged into the defaults, which stay intact.
+        expected_headers = api.HEADERS.copy()
+        expected_headers.update({"x-cg-demo-api-key": "cg-test-key"})
+        mock_get.assert_called_once_with("test_url", headers=expected_headers)
+        # The module level defaults must not be mutated.
+        self.assertNotIn("x-cg-demo-api-key", api.HEADERS)
 
     @patch("requests.get")
     def test_api_get_request_wrong_json_response(self, mock_get):

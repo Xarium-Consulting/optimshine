@@ -6,6 +6,7 @@
 #
 
 import io
+import jwt
 import os
 import logging
 import unittest
@@ -16,6 +17,13 @@ import tests.test_api_shine_data as api_data
 
 from datetime import datetime, timedelta
 from unittest.mock import patch
+
+# The "exp" claim carried by api_data.test_token. Derived from the fixture so
+# the two never drift apart.
+TEST_TOKEN_EXP = jwt.decode(
+    api_data.test_token[len("Bearer_"):],
+    options={"verify_signature": False},
+)["exp"]
 
 
 class TestApiShine(unittest.TestCase):
@@ -41,10 +49,17 @@ class TestApiShine(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("wrong_endpoint API endpoint not found!", stdout)
 
+    @patch("optimshine.api_shine.datetime")
     @patch("optimshine.api_common.ApiCommon.api_post_request")
-    def test_user_login(self, mock_api_post_request):
+    def test_user_login(self, mock_api_post_request, mock_datetime):
         mock_api_post_request.return_value = (
             {"data": {"token": api_data.test_token}}
+        )
+        # The token's own expiry is used only when it is less than 24h away.
+        # Pin "now" just before the expiry so this test covers the
+        # uncapped path regardless of the real date.
+        mock_datetime.datetime.now.return_value = (
+            datetime.fromtimestamp(TEST_TOKEN_EXP) - timedelta(hours=1)
         )
 
         cls_api_shine = api.ApiShine(self.log)
@@ -52,7 +67,7 @@ class TestApiShine(unittest.TestCase):
         self.assertTrue(hasattr(cls_api_shine, "token"))
         self.assertEqual(cls_api_shine.token, api_data.test_token)
         self.assertTrue(hasattr(cls_api_shine, "token_ttl"))
-        self.assertEqual(cls_api_shine.token_ttl, 1748987050)
+        self.assertEqual(cls_api_shine.token_ttl, TEST_TOKEN_EXP)
         self.assertTrue(result)
 
     @patch("optimshine.api_common.ApiCommon.api_post_request")
@@ -96,8 +111,11 @@ class TestApiShine(unittest.TestCase):
         mock_api_post_request.return_value = (
             {"data": {"token": api_data.test_token}}
         )
-        mock_now = datetime.fromtimestamp(1748987050) - timedelta(days=1,
-                                                                  hours=1)
+        # More than 24h before the token expires, so the 24h cap applies.
+        mock_now = (
+            datetime.fromtimestamp(TEST_TOKEN_EXP)
+            - timedelta(days=1, hours=1)
+        )
         mock_datatime.datetime.now.return_value = mock_now
         excepted_ttl_ts = (mock_now + timedelta(days=1)).timestamp()
         cls_api_shine = api.ApiShine(self.log)

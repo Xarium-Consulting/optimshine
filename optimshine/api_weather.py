@@ -10,7 +10,7 @@ import datetime
 from zoneinfo import ZoneInfo
 
 from logging import RootLogger
-from optimshine.api_common import ApiCommon
+from optimshine.api_common import ApiCommon, MARKET_TIMEZONE
 
 
 class ApiWeather(ApiCommon):
@@ -20,6 +20,12 @@ class ApiWeather(ApiCommon):
     to obtain sunrise and sunset times, as well as weather data.
     """
     def __init__(self, log: RootLogger):
+        """
+        Initialize the weather API client.
+
+        Args:
+            log (RootLogger): The logger used for all logging.
+        """
         self.log = log
 
     def get_timestamp_hour(self, date, time):
@@ -47,6 +53,12 @@ class ApiWeather(ApiCommon):
         Convert a given date and time into a UTC timestamp representing
         the start of the quarter (15-minute interval).
 
+        The date and time are interpreted in the market timezone, because the
+        resulting timestamp is used to look up RCE prices, whose quarters are
+        settled on market local time. Resolving them in the host's timezone
+        instead would select the wrong quarter on any machine not set to the
+        market timezone.
+
         Args:
             date (str): The date in the format 'YYYY-MM-DD'.
             time (str): The time in the format 'HH:MM:SS AM/PM'.
@@ -57,7 +69,7 @@ class ApiWeather(ApiCommon):
         dt_time = datetime.datetime.strptime(
             f"{date} {time}",
             "%Y-%m-%d %I:%M:%S %p",
-        )
+        ).replace(tzinfo=MARKET_TIMEZONE)
         quarter = dt_time.replace(minute=0, second=0, microsecond=0)
         quarter += datetime.timedelta(
             minutes=15 * (dt_time.minute // 15)

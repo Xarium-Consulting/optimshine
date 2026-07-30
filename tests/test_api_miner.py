@@ -579,6 +579,22 @@ class TestApiMiner(unittest.TestCase):
         self.assertEqual(len(fake_sock.sent_payloads), 1)
         self.assertEqual(fake_sock.close_count, 1)
 
+    # Missing configuration: _load_config returns None, so _send_command bails
+    # out before opening a socket.
+    # Validates: Requirements 2.3
+    def test_send_command_missing_config_returns_none_without_socket(self):
+        cls_api_miner = api.ApiMiner(self.log)
+
+        env = {"MINER_IP": "", "COINGECKO_API_KEY": ""}
+        with patch.dict("os.environ", env, clear=False):
+            with patch(
+                "optimshine.api_miner.socket.create_connection"
+            ) as mock_connect:
+                result = cls_api_miner._send_command({"command": "summary"})
+
+        self.assertIsNone(result)
+        mock_connect.assert_not_called()
+
     # Connection failure: create_connection raises OSError -> None.
     # Validates: Requirements 2.3
     def test_send_command_connection_failure_returns_none(self):
@@ -984,6 +1000,34 @@ class TestApiMiner(unittest.TestCase):
         self.assertEqual(cls_api_miner.summary_data, prior)
         # The offending response is included in the error log.
         self.assertIn("SUMMARY", stdio.getvalue())
+
+    # Malformed SUMMARY sections: the section is not a list, is an empty list,
+    # or its first element is not a dict. Each is rejected rather than raising.
+    # Validates: Requirements 3.2
+    def test_summary_malformed_section_returns_false(self):
+        cls_api_miner = api.ApiMiner(self.log)
+
+        for section in ("not-a-list", [], [["not-a-dict"]], [None]):
+            with self.subTest(section=section):
+                response = {
+                    "STATUS": [{"STATUS": "S"}],
+                    "SUMMARY": section,
+                    "id": 1,
+                }
+                with patch.object(
+                    cls_api_miner, "_send_command", return_value=response
+                ):
+                    self.assertFalse(cls_api_miner.summary())
+
+    # A response that is not a dict at all is rejected by summary.
+    # Validates: Requirements 3.2
+    def test_summary_non_dict_response_returns_false(self):
+        cls_api_miner = api.ApiMiner(self.log)
+
+        with patch.object(
+            cls_api_miner, "_send_command", return_value=["not", "a", "dict"]
+        ):
+            self.assertFalse(cls_api_miner.summary())
 
     # Real cgminer firmware (e.g. 4.11.1) returns the hash rate in SUMMARY but
     # no Temperature/Status field, reporting command status in the STATUS
@@ -1657,7 +1701,7 @@ class TestApiMiner(unittest.TestCase):
 
     # Success path: the BTC price and last-updated date are returned as a
     # dict.
-    def test_get_btc_price_success_returns_price_and_date(self):
+    def test_fetch_btc_price_success_returns_price_and_date(self):
         cls_api_miner = api.ApiMiner(self.log)
         response = self._btc_price_response(
             price=250000.0, last_updated_at=1752710400
@@ -1672,7 +1716,7 @@ class TestApiMiner(unittest.TestCase):
             with patch.object(
                 cls_api_miner, "api_get_request", return_value=response
             ) as mock_get:
-                result = cls_api_miner._get_btc_price()
+                result = cls_api_miner._fetch_btc_price()
 
         # last_updated_at 1752710400 == 2025-07-17 00:00:00 UTC.
         self.assertEqual(result["price"], 250000.0)
@@ -1686,7 +1730,7 @@ class TestApiMiner(unittest.TestCase):
 
     # The CoinGecko API key from the environment is forwarded as the
     # x-cg-demo-api-key header and the bitcoin/pln price endpoint is queried.
-    def test_get_btc_price_sends_api_key_header_and_pln_query(self):
+    def test_fetch_btc_price_sends_api_key_header_and_pln_query(self):
         cls_api_miner = api.ApiMiner(self.log)
 
         env = {
@@ -1700,7 +1744,7 @@ class TestApiMiner(unittest.TestCase):
                 "api_get_request",
                 return_value=self._btc_price_response(),
             ) as mock_get:
-                cls_api_miner._get_btc_price()
+                cls_api_miner._fetch_btc_price()
 
         mock_get.assert_called_once()
         args, kwargs = mock_get.call_args
@@ -1713,7 +1757,7 @@ class TestApiMiner(unittest.TestCase):
 
     # When last_updated_at is absent, the current UTC time is used as the date
     # while the price is still returned.
-    def test_get_btc_price_missing_last_updated_uses_current_time(self):
+    def test_fetch_btc_price_missing_last_updated_uses_current_time(self):
         cls_api_miner = api.ApiMiner(self.log)
         response = {"bitcoin": {"pln": 123456.0}}
 
@@ -1726,7 +1770,7 @@ class TestApiMiner(unittest.TestCase):
             with patch.object(
                 cls_api_miner, "api_get_request", return_value=response
             ):
-                result = cls_api_miner._get_btc_price()
+                result = cls_api_miner._fetch_btc_price()
 
         self.assertEqual(result["price"], 123456.0)
         # A tz-aware UTC datetime is returned even without last_updated_at.
@@ -1735,7 +1779,7 @@ class TestApiMiner(unittest.TestCase):
 
     # Missing config (e.g. COINGECKO_API_KEY unset) -> returns None without
     # querying CoinGecko.
-    def test_get_btc_price_missing_config_returns_none(self):
+    def test_fetch_btc_price_missing_config_returns_none(self):
         cls_api_miner = api.ApiMiner(self.log)
 
         env = {"MINER_IP": "192.168.1.10", "MINER_PORT": "4028"}
@@ -1744,13 +1788,13 @@ class TestApiMiner(unittest.TestCase):
             with patch.object(
                 cls_api_miner, "api_get_request"
             ) as mock_get:
-                result = cls_api_miner._get_btc_price()
+                result = cls_api_miner._fetch_btc_price()
 
         self.assertIsNone(result)
         mock_get.assert_not_called()
 
     # No response from CoinGecko (None) -> None and a warning is logged.
-    def test_get_btc_price_no_response_returns_none_and_warns(self):
+    def test_fetch_btc_price_no_response_returns_none_and_warns(self):
         cls_api_miner = api.ApiMiner(self.log)
         stdio = self._capture_log()
 
@@ -1763,14 +1807,14 @@ class TestApiMiner(unittest.TestCase):
             with patch.object(
                 cls_api_miner, "api_get_request", return_value=None
             ):
-                result = cls_api_miner._get_btc_price()
+                result = cls_api_miner._fetch_btc_price()
 
         self.assertIsNone(result)
         self.assertIn("BTC price is not available!", stdio.getvalue())
 
     # Unexpected response shape (missing bitcoin/pln keys) -> None and a
     # warning is logged.
-    def test_get_btc_price_unexpected_shape_returns_none_and_warns(self):
+    def test_fetch_btc_price_unexpected_shape_returns_none_and_warns(self):
         cls_api_miner = api.ApiMiner(self.log)
         stdio = self._capture_log()
 
@@ -1785,13 +1829,13 @@ class TestApiMiner(unittest.TestCase):
                 "api_get_request",
                 return_value={"unexpected": "payload"},
             ):
-                result = cls_api_miner._get_btc_price()
+                result = cls_api_miner._fetch_btc_price()
 
         self.assertIsNone(result)
         self.assertIn("BTC price is not available!", stdio.getvalue())
 
     # Null price value -> None and a warning is logged.
-    def test_get_btc_price_null_price_returns_none_and_warns(self):
+    def test_fetch_btc_price_null_price_returns_none_and_warns(self):
         cls_api_miner = api.ApiMiner(self.log)
         stdio = self._capture_log()
         response = {"bitcoin": {"pln": None, "last_updated_at": 1752710400}}
@@ -1805,10 +1849,134 @@ class TestApiMiner(unittest.TestCase):
             with patch.object(
                 cls_api_miner, "api_get_request", return_value=response
             ):
-                result = cls_api_miner._get_btc_price()
+                result = cls_api_miner._fetch_btc_price()
 
         self.assertIsNone(result)
         self.assertIn("BTC price is not available!", stdio.getvalue())
+
+    # ------------------------------------------------------------------ #
+    # Unit tests for the _get_btc_price cache.                           #
+    # ------------------------------------------------------------------ #
+
+    def _btc_price(self, price=250000.0):
+        """
+        Build a BTC price record of the shape _fetch_btc_price returns.
+
+        Args:
+            price (float, optional): The price in PLN. Defaults to 250000.0.
+
+        Returns:
+            dict: A record with a ``date`` and a ``price``.
+        """
+        return {
+            "date": datetime.datetime(
+                2025, 7, 17, tzinfo=datetime.timezone.utc
+            ),
+            "price": price,
+        }
+
+    # Repeated calls within the TTL reuse the cached value, so CoinGecko is
+    # queried exactly once.
+    def test_get_btc_price_caches_within_ttl(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        expected = self._btc_price()
+
+        with patch.object(
+            cls_api_miner, "_fetch_btc_price", return_value=expected
+        ) as mock_fetch:
+            first = cls_api_miner._get_btc_price()
+            second = cls_api_miner._get_btc_price()
+            third = cls_api_miner._get_btc_price()
+
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(third, expected)
+        mock_fetch.assert_called_once()
+
+    # Once the TTL has elapsed the price is fetched again.
+    def test_get_btc_price_refetches_after_ttl(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        fresh = self._btc_price(price=260000.0)
+
+        with patch.object(
+            cls_api_miner, "_fetch_btc_price", return_value=self._btc_price()
+        ) as mock_fetch:
+            cls_api_miner._get_btc_price()
+            mock_fetch.assert_called_once()
+
+        # Age the cache past the TTL.
+        cls_api_miner._btc_price_cached_at -= (api.BTC_PRICE_CACHE_TTL + 1)
+
+        with patch.object(
+            cls_api_miner, "_fetch_btc_price", return_value=fresh
+        ) as mock_fetch:
+            result = cls_api_miner._get_btc_price()
+
+        mock_fetch.assert_called_once()
+        self.assertEqual(result, fresh)
+
+    # A failed fetch is not cached, so the next call retries and can recover.
+    def test_get_btc_price_does_not_cache_failure(self):
+        cls_api_miner = api.ApiMiner(self.log)
+
+        with patch.object(
+            cls_api_miner, "_fetch_btc_price", return_value=None
+        ) as mock_fetch:
+            self.assertIsNone(cls_api_miner._get_btc_price())
+            self.assertIsNone(cls_api_miner._get_btc_price())
+
+        # Both calls attempted a real fetch; nothing was cached.
+        self.assertEqual(mock_fetch.call_count, 2)
+        self.assertFalse(hasattr(cls_api_miner, "_btc_price_cache"))
+
+        # A later success is returned and cached as usual.
+        expected = self._btc_price()
+        with patch.object(
+            cls_api_miner, "_fetch_btc_price", return_value=expected
+        ) as mock_fetch:
+            self.assertEqual(cls_api_miner._get_btc_price(), expected)
+            self.assertEqual(cls_api_miner._get_btc_price(), expected)
+
+        mock_fetch.assert_called_once()
+
+    # A cache timestamp in the future (for example after a clock change) is
+    # treated as stale rather than reused indefinitely.
+    def test_get_btc_price_ignores_future_cache_timestamp(self):
+        cls_api_miner = api.ApiMiner(self.log)
+        stale = self._btc_price(price=1.0)
+        fresh = self._btc_price(price=260000.0)
+
+        cls_api_miner._btc_price_cache = stale
+        cls_api_miner._btc_price_cached_at = (
+            datetime.datetime.now().timestamp() + 3600
+        )
+
+        with patch.object(
+            cls_api_miner, "_fetch_btc_price", return_value=fresh
+        ) as mock_fetch:
+            result = cls_api_miner._get_btc_price()
+
+        mock_fetch.assert_called_once()
+        self.assertEqual(result, fresh)
+
+    # The cache works when ApiMiner is mixed into a class that never calls
+    # ApiMiner.__init__, which is how OptimShine uses it.
+    def test_get_btc_price_cache_without_init(self):
+        class Mixed(api.ApiMiner):
+            def __init__(self, log):
+                # Deliberately does not call ApiMiner.__init__.
+                self.log = log
+
+        cls_mixed = Mixed(self.log)
+        expected = self._btc_price()
+
+        with patch.object(
+            cls_mixed, "_fetch_btc_price", return_value=expected
+        ) as mock_fetch:
+            self.assertEqual(cls_mixed._get_btc_price(), expected)
+            self.assertEqual(cls_mixed._get_btc_price(), expected)
+
+        mock_fetch.assert_called_once()
 
     # ------------------------------------------------------------------ #
     # Unit tests for get_current_miner_profitability (mocked BTC price).  #
@@ -1828,10 +1996,12 @@ class TestApiMiner(unittest.TestCase):
         for mode in ("Eco", "Standard", "Super"):
             with self.subTest(mode=mode):
                 cls_api_miner = api.ApiMiner(self.log)
+                # The consumption constants are in watts, so they are
+                # converted to kWh consumed per 24h.
                 expected = (
                     api.WORKMODE_AVERAGE_PROFITABILITY[mode]
                     * btc_price["price"]
-                    / api.WORKMODE_POWER_CONSUMPTION[mode]
+                    / (api.WORKMODE_POWER_CONSUMPTION[mode] * 24 / 1000)
                 )
                 with patch.object(
                     cls_api_miner, "_get_btc_price", return_value=btc_price

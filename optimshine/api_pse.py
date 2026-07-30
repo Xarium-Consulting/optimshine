@@ -5,11 +5,11 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from logging import RootLogger
-from optimshine.api_common import ApiCommon
+from optimshine.api_common import ApiCommon, MARKET_TIMEZONE
 
 
 class ApiPse(ApiCommon):
@@ -17,6 +17,12 @@ class ApiPse(ApiCommon):
     ApiPse is a class for interacting with the PSE RCE API.
     """
     def __init__(self, log: RootLogger):
+        """
+        Initialize the PSE API client.
+
+        Args:
+            log (RootLogger): The logger used for all logging.
+        """
         self.log = log
 
     def get_pse_data(self, date):
@@ -52,10 +58,17 @@ class ApiPse(ApiCommon):
             return False
 
         self.rce_date = date
+        # PSE reports "dtime" as the END of each 15 minute period (a quarter
+        # labelled "00:00 - 00:15" carries dtime 00:15). Key the prices by the
+        # period START so a lookup for "the quarter containing now" matches the
+        # period that is currently in effect.
         self.rce_prices = {
-            datetime.strptime(quarter["dtime"], "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=ZoneInfo("Europe/Warsaw")
-                ).astimezone(ZoneInfo("UTC")).timestamp(): quarter["rce_pln"]
+            (
+                datetime.strptime(
+                    quarter["dtime"], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=MARKET_TIMEZONE)
+                - timedelta(minutes=15)
+            ).astimezone(ZoneInfo("UTC")).timestamp(): quarter["rce_pln"]
             for quarter in response_data
         }
 
