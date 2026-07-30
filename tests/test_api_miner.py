@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import socket
+import time
 import unittest
 
 import optimshine.api_miner as api
@@ -2129,17 +2130,70 @@ class TestApiMinerIntegration(unittest.TestCase):
 
         self.cls_api_miner = api.ApiMiner(self.log)
 
-        # Read the operating mode that is currently in effect so it can be
-        # restored in tearDown after any mode change (Req 9.7).
+        # Record the state to restore in tearDown: the active operating mode
+        # and whether the miner was powered on before the test ran (Req 9.7).
         self._original_mode = self._current_mode()
+        self._was_powered_on = self._soft_power_on()
 
     def tearDown(self):
-        # Restore the operating mode that was in effect before the test ran,
-        # undoing any mode change performed during the test (Req 9.7).
+        # Restore the state that was in effect before the test ran, undoing any
+        # mode change or power change performed during the test (Req 9.7).
         original_mode = getattr(self, "_original_mode", None)
         if original_mode is not None:
             self.cls_api_miner.set_mode(original_mode)
+
+        # Only power down when the miner was known to be off beforehand. An
+        # indeterminate reading must not switch off a miner that was running.
+        if getattr(self, "_was_powered_on", None) is False:
+            self.cls_api_miner.off()
+            time.sleep(api.ASCSET_DELAY + 2)
         self.log.handlers.clear()
+
+    def _soft_power_on(self):
+        """
+        Report whether the miner is soft-powered on.
+
+        This is the commanded power state, not a measure of work being done.
+        The Avalon Q reports the two soft on/off commands it last accepted as
+        ``SoftOnTime[<unix_ts>]`` and ``SoftOffTime[<unix_ts>]`` in its
+        ``estats`` output, so whichever timestamp is later identifies the state
+        currently in effect.
+
+        Two fields are deliberately not used:
+
+        - ``SoftOFF[<n>]`` is not a boolean. A live miner reports values such
+          as 4, so comparing it against 0 reads as "off" even when the miner is
+          running.
+        - the hash rate, because a miner that has just been powered on reports
+          no hash rate until it has reached a pool and taken work, so zero does
+          not distinguish "off" from "on but not yet hashing".
+
+        Returns:
+            bool or None: True when the miner is powered on, False when it is
+                          switched off, or None when the state cannot be
+                          determined.
+        """
+        response = self.cls_api_miner._send_command({"command": "estats"})
+        if not isinstance(response, dict):
+            return None
+
+        stats = response.get("STATS")
+        if not isinstance(stats, list):
+            return None
+
+        blob = json.dumps(stats)
+        on_match = re.search(r"SoftOnTime\[(\d+)\]", blob)
+        off_match = re.search(r"SoftOffTime\[(\d+)\]", blob)
+        if not on_match or not off_match:
+            return None
+
+        on_time = int(on_match.group(1))
+        off_time = int(off_match.group(1))
+        if on_time == off_time:
+            # Cannot tell which command came last.
+            return None
+
+        return on_time > off_time
 
     def _current_mode(self):
         """
@@ -2173,11 +2227,34 @@ class TestApiMinerIntegration(unittest.TestCase):
         return reverse.get(int(match.group(1)))
 
     # Against the real miner, summary, set_mode, and check each return True.
-    # The mode change is restored in tearDown.
+    # A mode change is only accepted while the miner is powered on, so the
+    # miner is switched on first when it was off. tearDown restores both the
+    # original mode and the original power state.
     # Validates: Requirements 9.6, 9.7
     def test_real_hardware_summary_set_mode_check(self):
         # summary succeeds against the real Avalon Q.
         self.assertTrue(self.cls_api_miner.summary())
+
+        # A mode change is only accepted while the miner is powered on, so turn
+        # it on first if it was off. The ascset action is scheduled
+        # ASCSET_DELAY seconds in the future, so wait for it to take effect
+        # before sending the mode change.
+        if self._was_powered_on is False:
+            self.log.info("Miner is off. Powering it on for the mode change.")
+            self.assertTrue(self.cls_api_miner.on())
+            time.sleep(api.ASCSET_DELAY + 40)
+            # Confirm the commanded power state flipped. The hash rate is
+            # deliberately not used: reaching a pool and taking work takes far
+            # longer than the ascset delay, so the miner can be powered on and
+            # legitimately not hashing yet.
+            self.assertIsNot(
+                self._soft_power_on(), False,
+                "Miner still reports soft-off after on()."
+            )
+        elif self._was_powered_on is None:
+            self.log.warning(
+                "Could not determine the miner power state; assuming it is on."
+            )
 
         # set_mode succeeds against the real Avalon Q. Prefer the mode that
         # was already in effect so the exercise is minimally disruptive; fall
