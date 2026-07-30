@@ -45,7 +45,7 @@ WORKMODE_AVERAGE_PROFITABILITY = {
 ASCSET_ON = "softon"
 ASCSET_OFF = "softoff"
 # Seconds in the future at which a soft on/off action should take effect.
-ASCSET_DELAY = 5
+ASCSET_DELAY = 2
 
 
 class ApiMiner(ApiCommon):
