@@ -156,8 +156,8 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
 
         Returns:
             bool: True if the current weather was determined, False when no
-                  weather data is available or the requested hour is outside
-                  the forecast range.
+                  weather data is available or the requested hour falls before
+                  the start or after the end of the forecast range.
         """
         self.cloudy_now = False
 
@@ -170,8 +170,8 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
             int((hour_ts - self.weather_data["first_sample_time"])
                 / self.weather_data["interval"])
             )
-        if sample_number >= len(self.weather_data["low_clouds_data"]):
-            self.log.error("Sample number out of range")
+        if not 0 <= sample_number < len(self.weather_data["low_clouds_data"]):
+            self.log.error(f"Sample number {sample_number} out of range")
             return False
 
         if self.weather_data["low_clouds_data"][sample_number] > 0.75:
@@ -426,6 +426,75 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
         self.log.info("PV production is too low for any miner mode")
         return "TOO_LOW"
 
+    def _select_miner_mode(self, inverter_pv):
+        """
+        Selects the miner operating mode to run, if any.
+
+        A mode is only worth running when it satisfies both constraints at
+        once:
+
+            - its profitability beats the current RCE price, otherwise the
+              energy is worth more sold to the grid
+            - its power consumption is covered by the available PV production
+
+        Checking the two separately is not equivalent: profitability falls as
+        consumption rises, so the most demanding mode the PV production can
+        cover may still lose to the grid price. Among the modes that satisfy
+        both, the least profitable one is chosen, which keeps the miner in the
+        most conservative mode that is still worth running.
+
+        Args:
+            inverter_pv (float): The available PV production, in watts.
+
+        Returns:
+            str or None: The operating mode to run, ``"pse"`` when no mode
+                         beats the current RCE price, ``"TOO_LOW"`` when the PV
+                         production covers no profitable mode, or None when the
+                         RCE price or the profitability figures are
+                         unavailable.
+        """
+        if not hasattr(self, "current_rce_price") or \
+                self.current_rce_price is None:
+            self.log.error("No current PSE price available!")
+            return None
+
+        if not getattr(self, "miner_profitability", None):
+            self.log.error("No miner profitability available!")
+            return None
+
+        profitable = {}
+        for mode, profitability in self.miner_profitability.items():
+            if profitability > self.current_rce_price:
+                profitable[mode] = profitability
+
+        if not profitable:
+            self.log.info("PSE price is more profitable")
+            return "pse"
+
+        chosen_mode = None
+        chosen_profitability = None
+        for mode, profitability in profitable.items():
+            consumption = WORKMODE_POWER_CONSUMPTION[mode]
+            self.log.debug(
+                f"'{mode}' profitability: {profitability} PLN/kWh beats "
+                f"{self.current_rce_price} PLN/kWh, consumption "
+                f"{consumption} W vs PV production {inverter_pv} W"
+            )
+            if consumption <= inverter_pv and (
+                chosen_profitability is None
+                or profitability < chosen_profitability
+            ):
+                chosen_profitability = profitability
+                chosen_mode = mode
+
+        if chosen_mode is None:
+            self.log.info("PV production is too low for any profitable miner "
+                          "mode")
+            return "TOO_LOW"
+
+        self.log.info(f"Mining is worthwhile in '{chosen_mode}' mode")
+        return chosen_mode
+
     def optim_charge_battery(self, inverter, mode):
         """
         Optimizes the battery charging current based on the specified mode.
@@ -575,26 +644,36 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
         """
         Determines and applies the daytime optimization strategy.
 
-        Hands over to the night strategy after sunset. Otherwise, for every
+        Hands over to the night strategy after sunset. A negative RCE price is
+        handled for the whole plant at once, since importing energy pays
+        regardless of the individual inverter readings. Otherwise, for every
         inverter, it combines the current RCE price, the cloud cover, the
         battery state of charge and the PV production to decide the battery
         charge mode and whether the miner should run, and in which mode:
 
-            - negative RCE price: fast charge and mine in Super mode
+            - negative RCE price: every battery fast charges and the miner
+              runs in Super mode
             - cloudy, low battery: fast charge, miner off
-            - cloudy, full battery: mine when it beats the PSE price and the PV
-              production covers a mode, otherwise sell the energy
+            - cloudy, full battery: mine in the mode chosen by
+              ``_select_miner_mode``, otherwise sell the energy
             - sunny, low battery: fast charge, miner off
             - sunny, high RCE price: no charge, miner off
             - sunny otherwise: slow charge (fast charge close to sunset) and
-              mine when it beats the PSE price and PV production allows it
+              mine in the mode chosen by ``_select_miner_mode``
+
+        A mode is only used when it both beats the current RCE price and is
+        covered by the PV production. See ``_select_miner_mode``.
 
         The next day optimization run is scheduled 15 minutes ahead.
 
+        Note that the miner is a single shared device, so its commands are
+        still issued once per inverter inside the loop below. With more than
+        one inverter the last iteration wins.
+
         Returns:
-            bool: True when the night strategy was scheduled instead or when a
-                  negative price pass finished early. None is returned after a
-                  regular day optimization pass.
+            bool: True when the night strategy was scheduled instead or when
+                  the negative price branch handled the whole plant. None is
+                  returned after a regular day optimization pass.
 
         Raises:
             RuntimeError: If the inverter list, the weather data or the daily
@@ -637,6 +716,25 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
             self.scheduler_list_jobs()
             raise RuntimeError
 
+        if self.current_rce_price < 0:
+            self.log.info("Negative energy price. "
+                          "Charging battery and mining")
+            for inverter in self.inverters:
+                self.optim_charge_battery(inverter, "fast_charge")
+            self.on()
+            time.sleep(20)
+            self.set_mode("Super")
+            self.scheduler.add_job(
+                self.optim_strategy_day,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(minutes=15)),
+                id="optim_strategy_day",
+                replace_existing=True
+            )
+            self.log.info("Scheduling next day optimization in 15 minutes")
+            self.scheduler_list_jobs()
+            return True
+
         for inverter in self.inverters:
             inverter_soc = None
             inverter_pv = None
@@ -655,21 +753,6 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                 self.scheduler_list_jobs()
                 raise RuntimeError
 
-            if self.current_rce_price < 0:
-                self.log.info("Negative energy price. "
-                              "Charging battery and mining")
-                self.optim_charge_battery(inverter, "fast_charge")
-                self.on()
-                time.sleep(20)
-                self.set_mode("Super")
-                self.scheduler.add_job(
-                    self.optim_strategy_day,
-                    trigger="date",
-                    run_date=(datetime.now() + timedelta(minutes=15)),
-                    id="optim_strategy_day",
-                    replace_existing=True
-                )
-                return True
             if self.cloudy_now:
                 if inverter_soc < 80:
                     self.log.info("Cloudy weather, low battery")
@@ -677,29 +760,26 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                     self.off()
                 else:
                     self.log.info("Cloudy weather, full battery")
-                    consumption_mode = self._compare_miner_to_pv_prod(
-                        inverter_pv
-                    )
-                    mode = self._compare_miner_to_pse()
-                    if mode == "pse":
+                    mode = self._select_miner_mode(inverter_pv)
+                    if mode is None or mode == "pse":
                         self.log.info("Charging battery and selling energy")
                         self.off()
-                    elif consumption_mode == "TOO_LOW":
+                    elif mode == "TOO_LOW":
                         self.log.info("Too low production to mine, charging "
                                       "battery and selling energy")
                         self.off()
                     else:
-                        self.log.info(f"Mining in {consumption_mode} mode.")
+                        self.log.info(f"Mining in {mode} mode.")
                         self.on()
                         time.sleep(20)
-                        self.set_mode(consumption_mode)
+                        self.set_mode(mode)
             else:
-                buffor_time = (datetime.now() + timedelta(hours=3)).timestamp()
+                buffer_time = (datetime.now() + timedelta(hours=3)).timestamp()
                 if inverter_soc < 35:
                     self.log.info("Sunny weather. Low battery.")
                     self.optim_charge_battery(inverter, "fast_charge")
                     self.off()
-                elif self.weather_data["sunset_time"] > buffor_time:
+                elif self.weather_data["sunset_time"] > buffer_time:
                     if self.current_rce_price > 0.6:
                         self.log.info("Sunny weather. High PSE price:"
                                       f" {self.current_rce_price}")
@@ -708,45 +788,39 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                     else:
                         self.optim_charge_battery(inverter, "slow_charge")
                         self.log.info("Sunny weather.")
-                        consumption_mode = self._compare_miner_to_pv_prod(
-                            inverter_pv
-                        )
-                        mode = self._compare_miner_to_pse()
-                        if mode == "pse":
+                        mode = self._select_miner_mode(inverter_pv)
+                        if mode is None or mode == "pse":
                             self.log.info("Charging battery and selling"
                                           " energy")
                             self.off()
-                        elif consumption_mode == "TOO_LOW":
+                        elif mode == "TOO_LOW":
                             self.log.info("Too low production to mine, "
                                           "charging battery and selling "
                                           "energy")
                             self.off()
                         else:
-                            self.log.info(f"Mining in {consumption_mode} mode")
+                            self.log.info(f"Mining in {mode} mode")
                             self.on()
                             time.sleep(20)
-                            self.set_mode(consumption_mode)
+                            self.set_mode(mode)
                 else:
                     self.log.info("Sunny weather. Almost dark,"
                                   " charging battery.")
                     self.optim_charge_battery(inverter, "fast_charge")
-                    consumption_mode = self._compare_miner_to_pv_prod(
-                        inverter_pv
-                    )
-                    mode = self._compare_miner_to_pse()
-                    if mode == "pse":
+                    mode = self._select_miner_mode(inverter_pv)
+                    if mode is None or mode == "pse":
                         self.log.info("Charging battery and selling"
                                       " energy")
                         self.off()
-                    elif consumption_mode == "TOO_LOW":
+                    elif mode == "TOO_LOW":
                         self.log.info("Too low production to mine, charging"
                                       " battery and selling energy")
                         self.off()
                     else:
-                        self.log.info(f"Mining in {consumption_mode} mode")
+                        self.log.info(f"Mining in {mode} mode")
                         self.on()
                         time.sleep(20)
-                        self.set_mode(consumption_mode)
+                        self.set_mode(mode)
 
         self.log.info("Setting optimization strategy was successful")
         self.scheduler.add_job(

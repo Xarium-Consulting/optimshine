@@ -552,8 +552,56 @@ class TestOptimShine(unittest.TestCase):
         status = self.cl._check_current_weather("2025-06-04", "10:00:00 AM")
 
         stdout = self.stdio.getvalue()
-        self.assertIn("Sample number out of range", stdout)
+        # The message reports the offending sample number.
+        self.assertIn("Sample number 2 out of range", stdout)
         self.assertFalse(status)
+
+    def test_check_current_weather_sample_before_range(self):
+        # An hour before the forecast starts yields a negative sample number.
+        # Indexing with it would read from the end of the list, so the last
+        # sample is made cloudy to prove that value is not used.
+        self.cl.weather_data = {
+            "first_sample_time": 86400,
+            "interval": 3600,
+            "low_clouds_data": [0.1, 0.1, 0.95],
+        }
+        self.cl.get_timestamp_hour = MagicMock(return_value=86400 - 3600)
+
+        status = self.cl._check_current_weather("2025-06-16", "12:00:00 PM")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("Sample number -1 out of range", stdout)
+        self.assertFalse(status)
+        self.assertFalse(self.cl.cloudy_now)
+
+    def test_check_current_weather_sample_far_before_range(self):
+        self.cl.weather_data = {
+            "first_sample_time": 86400,
+            "interval": 3600,
+            "low_clouds_data": [0.95, 0.95, 0.95],
+        }
+        self.cl.get_timestamp_hour = MagicMock(return_value=0)
+
+        status = self.cl._check_current_weather("2025-06-16", "12:00:00 PM")
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("out of range", stdout)
+        self.assertFalse(status)
+        self.assertFalse(self.cl.cloudy_now)
+
+    def test_check_current_weather_first_sample_in_range(self):
+        # The lower bound itself is valid.
+        self.cl.weather_data = {
+            "first_sample_time": 86400,
+            "interval": 3600,
+            "low_clouds_data": [0.9, 0.1],
+        }
+        self.cl.get_timestamp_hour = MagicMock(return_value=86400)
+
+        status = self.cl._check_current_weather("2025-06-16", "12:00:00 PM")
+
+        self.assertTrue(status)
+        self.assertTrue(self.cl.cloudy_now)
 
     def test_check_current_weather_cloudy(self):
         self.cl.weather_data = {
@@ -760,6 +808,102 @@ class TestOptimShine(unittest.TestCase):
         self.assertEqual(
             self.cl.get_current_miner_profitability.call_count, 3
         )
+
+    def test_select_miner_mode_no_price(self):
+        self.cl.miner_profitability = {"Eco": 0.5}
+
+        mode = self.cl._select_miner_mode(5000)
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("No current PSE price available!", stdout)
+        self.assertIsNone(mode)
+
+    def test_select_miner_mode_no_profitability(self):
+        self.cl.current_rce_price = 0.25
+
+        mode = self.cl._select_miner_mode(5000)
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("No miner profitability available!", stdout)
+        self.assertIsNone(mode)
+
+    def test_select_miner_mode_price_beats_every_mode(self):
+        self.cl.current_rce_price = 1.0
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+
+        mode = self.cl._select_miner_mode(5000)
+
+        stdout = self.stdio.getvalue()
+        self.assertIn("PSE price is more profitable", stdout)
+        self.assertEqual(mode, "pse")
+
+    def test_select_miner_mode_picks_least_profitable_feasible(self):
+        # All three beat the price and PV covers all three. Profitability falls
+        # as consumption rises, so the least profitable feasible mode is Super.
+        self.cl.current_rce_price = 0.1
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+
+        mode = self.cl._select_miner_mode(
+            WORKMODE_POWER_CONSUMPTION["Super"] + 500
+        )
+
+        self.assertEqual(mode, "Super")
+
+    def test_select_miner_mode_rejects_unprofitable_covered_mode(self):
+        # The regression this method exists for: PV covers Super, but only Eco
+        # beats the grid price. Selecting on PV coverage alone would mine in
+        # Super at a loss.
+        self.cl.current_rce_price = 0.30
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+
+        mode = self.cl._select_miner_mode(
+            WORKMODE_POWER_CONSUMPTION["Super"] + 500
+        )
+
+        self.assertEqual(mode, "Eco")
+
+    def test_select_miner_mode_profitable_but_pv_too_low(self):
+        # Eco is the only profitable mode and the PV production cannot even
+        # cover it, so nothing should run.
+        self.cl.current_rce_price = 0.30
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+
+        mode = self.cl._select_miner_mode(
+            WORKMODE_POWER_CONSUMPTION["Eco"] - 1
+        )
+
+        stdout = self.stdio.getvalue()
+        self.assertIn(
+            "PV production is too low for any profitable miner mode", stdout
+        )
+        self.assertEqual(mode, "TOO_LOW")
+
+    def test_select_miner_mode_prefers_larger_when_both_feasible(self):
+        # Eco and Standard both beat the price and both fit; Standard is the
+        # less profitable of the two, so it is chosen.
+        self.cl.current_rce_price = 0.275
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+
+        mode = self.cl._select_miner_mode(
+            WORKMODE_POWER_CONSUMPTION["Super"] + 500
+        )
+
+        self.assertEqual(mode, "Standard")
+
+    def test_select_miner_mode_equal_price_is_not_profitable(self):
+        # Strictly greater than the price is required.
+        self.cl.current_rce_price = 0.34
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+
+        mode = self.cl._select_miner_mode(100000)
+
+        self.assertEqual(mode, "pse")
 
     def test_compare_miner_to_pv_prod_too_low(self):
         mode = self.cl._compare_miner_to_pv_prod(0.5)
@@ -1134,6 +1278,78 @@ class TestOptimShine(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertTrue(status)
 
+    @patch("optimshine.optim_shine.time")
+    def test_optim_strategy_day_negative_price_all_inverters(self, mock_time):
+        self._setup_strategy()
+        self.cl.inverters = ["INV1", "INV2", "INV3"]
+        self.cl.current_rce_price = -0.1
+
+        status = self.cl.optim_strategy_day()
+
+        # Every battery is charged, not just the first one.
+        self.cl.optim_charge_battery.assert_has_calls([
+            call("INV1", "fast_charge"),
+            call("INV2", "fast_charge"),
+            call("INV3", "fast_charge"),
+        ])
+        self.assertEqual(self.cl.optim_charge_battery.call_count, 3)
+        # The miner is a single shared device, so it is commanded once.
+        self.cl.on.assert_called_once()
+        self.cl.set_mode.assert_called_once_with("Super")
+        mock_time.sleep.assert_called_once_with(20)
+        self.assertIsNotNone(self.cl.scheduler.get_job("optim_strategy_day"))
+        self.assertTrue(status)
+
+    def test_optim_strategy_day_negative_price_skips_inverter_reads(self):
+        self._setup_strategy()
+        self.cl.inverters = ["INV1", "INV2"]
+        self.cl.current_rce_price = -0.1
+
+        with patch("optimshine.optim_shine.time"):
+            self.assertTrue(self.cl.optim_strategy_day())
+
+        # The decision needs no per-inverter readings, so none are taken.
+        self.cl._get_inverter_judge_factors.assert_not_called()
+
+    @patch("optimshine.optim_shine.time")
+    def test_optim_strategy_day_skips_unprofitable_covered_mode(self,
+                                                                mock_time):
+        # End to end regression: PV covers Super but only Eco beats the grid
+        # price, so the miner must run in Eco rather than the biggest covered
+        # mode. _select_miner_mode is deliberately not mocked here.
+        self._setup_strategy()
+        self.cl.current_rce_price = 0.30
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+        self.cl._get_inverter_judge_factors = MagicMock(
+            return_value=(50.0, WORKMODE_POWER_CONSUMPTION["Super"] + 500)
+        )
+
+        self.cl.optim_strategy_day()
+
+        self.cl.on.assert_called_once()
+        self.cl.set_mode.assert_called_once_with("Eco")
+        self.cl.off.assert_not_called()
+
+    @patch("optimshine.optim_shine.time")
+    def test_optim_strategy_day_sells_when_no_mode_profitable(self,
+                                                              mock_time):
+        # PV covers every mode, but none beats the grid price, so the miner
+        # stays off and the energy is sold.
+        self._setup_strategy()
+        self.cl.current_rce_price = 0.50
+        self.cl.miner_profitability = {"Eco": 0.34, "Standard": 0.28,
+                                       "Super": 0.27}
+        self.cl._get_inverter_judge_factors = MagicMock(
+            return_value=(50.0, WORKMODE_POWER_CONSUMPTION["Super"] + 500)
+        )
+
+        self.cl.optim_strategy_day()
+
+        self.cl.off.assert_called_once()
+        self.cl.on.assert_not_called()
+        self.cl.set_mode.assert_not_called()
+
     def test_optim_strategy_day_cloudy_low_battery(self):
         self._setup_strategy()
         self.cl.cloudy_now = True
@@ -1157,8 +1373,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl._get_inverter_judge_factors = MagicMock(
             return_value=(85.0, 2000.0)
         )
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="Eco")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="pse")
+        self.cl._select_miner_mode = MagicMock(return_value="pse")
 
         self.cl.optim_strategy_day()
 
@@ -1174,8 +1389,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl._get_inverter_judge_factors = MagicMock(
             return_value=(85.0, 0.1)
         )
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="TOO_LOW")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="Eco")
+        self.cl._select_miner_mode = MagicMock(return_value="TOO_LOW")
 
         self.cl.optim_strategy_day()
 
@@ -1191,8 +1405,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl._get_inverter_judge_factors = MagicMock(
             return_value=(85.0, 2000.0)
         )
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="Standard")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="Eco")
+        self.cl._select_miner_mode = MagicMock(return_value="Standard")
 
         self.cl.optim_strategy_day()
 
@@ -1236,8 +1449,7 @@ class TestOptimShine(unittest.TestCase):
 
     def test_optim_strategy_day_sunny_sell(self):
         self._setup_strategy()
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="Eco")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="pse")
+        self.cl._select_miner_mode = MagicMock(return_value="pse")
 
         self.cl.optim_strategy_day()
 
@@ -1251,8 +1463,7 @@ class TestOptimShine(unittest.TestCase):
 
     def test_optim_strategy_day_sunny_pv_too_low(self):
         self._setup_strategy()
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="TOO_LOW")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="Eco")
+        self.cl._select_miner_mode = MagicMock(return_value="TOO_LOW")
 
         self.cl.optim_strategy_day()
 
@@ -1267,8 +1478,7 @@ class TestOptimShine(unittest.TestCase):
     @patch("optimshine.optim_shine.time")
     def test_optim_strategy_day_sunny_mining(self, mock_time):
         self._setup_strategy()
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="Super")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="Eco")
+        self.cl._select_miner_mode = MagicMock(return_value="Super")
 
         self.cl.optim_strategy_day()
 
@@ -1290,8 +1500,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl.weather_data["sunset_time"] = (
             datetime.now() + timedelta(hours=1)
         ).timestamp()
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="Eco")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="Eco")
+        self.cl._select_miner_mode = MagicMock(return_value="Eco")
 
         self.cl.optim_strategy_day()
 
@@ -1310,8 +1519,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl.weather_data["sunset_time"] = (
             datetime.now() + timedelta(hours=1)
         ).timestamp()
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="Eco")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="pse")
+        self.cl._select_miner_mode = MagicMock(return_value="pse")
 
         self.cl.optim_strategy_day()
 
@@ -1329,8 +1537,7 @@ class TestOptimShine(unittest.TestCase):
         self.cl.weather_data["sunset_time"] = (
             datetime.now() + timedelta(hours=1)
         ).timestamp()
-        self.cl._compare_miner_to_pv_prod = MagicMock(return_value="TOO_LOW")
-        self.cl._compare_miner_to_pse = MagicMock(return_value="Eco")
+        self.cl._select_miner_mode = MagicMock(return_value="TOO_LOW")
 
         self.cl.optim_strategy_day()
 
