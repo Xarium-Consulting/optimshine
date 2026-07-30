@@ -743,54 +743,54 @@ class TestOptimShine(unittest.TestCase):
                                                              "slow_charge")
         self.assertTrue(status)
 
-    def test_optim_strategy_optim_false(self):
+    def test_optim_strategy_day_optim_false(self):
         self.cl.optim = False
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
         self.assertIn("Optimization not needed", stdout)
         self.assertTrue(status)
 
-    def test_optim_strategy_none_optim_dates(self):
+    def test_optim_strategy_day_none_optim_dates(self):
         self.cl.optim = True
         self.cl.optim_date = None
         self.cl.soc_check_date = None
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
         self.assertIn("Optimization dates not set", stdout)
         self.assertFalse(status)
 
-    def test_optim_strategy_none_min_price(self):
+    def test_optim_strategy_day_none_min_price(self):
         self.cl.optim = True
         self.cl.optim_date = datetime.now() + timedelta(hours=3)
         self.cl.soc_check_date = datetime.now() + timedelta(minutes=10)
         self.cl.min_price = None
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
         self.assertIn("RCE minimal price price not set", stdout)
         self.assertFalse(status)
 
-    def test_optim_strategy_none_inverters(self):
+    def test_optim_strategy_day_none_inverters(self):
         self.cl.optim = True
         self.cl.optim_date = datetime.now() - timedelta(hours=3)
         self.cl.soc_check_date = datetime.now() + timedelta(minutes=10)
         self.cl.min_price = -1
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
         self.assertIn("No inverter list found", stdout)
         self.assertFalse(status)
 
-    def test_optim_strategy_missed_pass(self):
+    def test_optim_strategy_day_missed_pass(self):
         self.cl.optim = True
         self.cl.optim_date = datetime.now() - timedelta(hours=3)
         self.cl.soc_check_date = datetime.now() + timedelta(minutes=10)
         self.cl.min_price = -1
         self.cl.inverters = ["INV"]
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
         self.assertIn("Optimization time was missed", stdout)
         self.assertFalse(self.cl.optim)
@@ -798,7 +798,7 @@ class TestOptimShine(unittest.TestCase):
         self.assertIsNone(self.cl.optim_date)
         self.assertTrue(status)
 
-    def test_optim_strategy_soc_delayed_pass_normal_mode(self):
+    def test_optim_strategy_day_soc_delayed_pass_normal_mode(self):
         self.cl.optim = True
         self.cl.optim_date = datetime.now() + timedelta(minutes=2)
         self.cl.soc_check_date = datetime.now() - timedelta(minutes=10)
@@ -809,7 +809,7 @@ class TestOptimShine(unittest.TestCase):
             "sunset_time": (datetime.now() - timedelta(hours=3)).timestamp(),
         }
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
 
         jobs = self.cl.scheduler.get_jobs()
@@ -821,7 +821,7 @@ class TestOptimShine(unittest.TestCase):
         self.assertEqual(job.kwargs["mode"], "normal_charge")
         self.assertTrue(status)
 
-    def test_optim_strategy_soc_optim_eod_pass_fast_mode(self):
+    def test_optim_strategy_day_soc_optim_eod_pass_fast_mode(self):
         self.cl.optim = True
         self.cl.optim_date = datetime.now() + timedelta(hours=2)
         self.cl.soc_check_date = datetime.now() + timedelta(minutes=10)
@@ -832,7 +832,7 @@ class TestOptimShine(unittest.TestCase):
             "sunset_time": (datetime.now() + timedelta(hours=3)).timestamp(),
         }
 
-        status = self.cl._optim_strategy()
+        status = self.cl.optim_strategy_day()
         stdout = self.stdio.getvalue()
 
         jobs = self.cl.scheduler.get_jobs()
@@ -862,12 +862,12 @@ class TestOptimShine(unittest.TestCase):
         self.assertIn("Failed to get judge factors", stdout)
         self.assertIsNotNone(job)
 
-    def test_optim_judge_optim_strategy_fail(self):
+    def test_optim_judgeoptim_strategy_day_fail(self):
         self.cl.judge_date = datetime.now()
         self.cl._get_daily_judge_factors = MagicMock()
         self.cl._get_daily_judge_factors.return_value = True
-        self.cl._optim_strategy = MagicMock()
-        self.cl._optim_strategy.return_value = False
+        self.cl.optim_strategy_day = MagicMock()
+        self.cl.optim_strategy_day.return_value = False
         self.cl.weather_data = {
             "sunrise_time": (datetime.now() - timedelta(hours=3)).timestamp(),
             "sunset_time": (datetime.now() + timedelta(hours=3)).timestamp(),
@@ -886,8 +886,8 @@ class TestOptimShine(unittest.TestCase):
         self.cl.judge_date = datetime.now()
         self.cl._get_daily_judge_factors = MagicMock()
         self.cl._get_daily_judge_factors.return_value = True
-        self.cl._optim_strategy = MagicMock()
-        self.cl._optim_strategy.return_value = True
+        self.cl.optim_strategy_day = MagicMock()
+        self.cl.optim_strategy_day.return_value = True
         self.cl.weather_data = {
             "sunrise_time": (datetime.now() + timedelta(hours=3)).timestamp(),
             "sunset_time": (datetime.now() + timedelta(hours=6)).timestamp(),

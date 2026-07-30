@@ -26,9 +26,9 @@ WORKMODE_MAP = {
 }
 
 WORKMODE_POWER_CONSUMPTION = {
-    "Eco": (0.8*24),
-    "Standard": (1.35*24),
-    "Super": (1.6*24),
+    "Eco": 800,
+    "Standard": 1350,
+    "Super": 1600,
 }
 
 WORKMODE_AVERAGE_PROFITABILITY = {
@@ -37,9 +37,14 @@ WORKMODE_AVERAGE_PROFITABILITY = {
     "Super": 0.000043,
 }
 
-# ascset payloads for enabling / disabling hashing
-ASCSET_ON = "0,softon,1"
-ASCSET_OFF = "0,softoff,1"
+# ascset options for enabling / disabling hashing. The Avalon Q expects the
+# payload "0,<option>,1: <unix_timestamp>" where the timestamp is a moment in
+# the near future at which the action takes effect; a bare "0,<option>,1" is
+# rejected with "parameter invalid".
+ASCSET_ON = "softon"
+ASCSET_OFF = "softoff"
+# Seconds in the future at which a soft on/off action should take effect.
+ASCSET_DELAY = 5
 
 
 class ApiMiner(ApiCommon):
@@ -268,6 +273,23 @@ class ApiMiner(ApiCommon):
         self.summary_data = summary
         return True
 
+    def _ascset_soft_parameter(self, option):
+        """
+        Build the ascset parameter for a soft on/off command.
+
+        The Avalon Q expects "0,<option>,1: <unix_timestamp>" where the
+        timestamp is a moment in the near future at which the action takes
+        effect.
+
+        Args:
+            option (str): The ascset option, ASCSET_ON or ASCSET_OFF.
+
+        Returns:
+            str: The formatted ascset parameter.
+        """
+        effective_at = int(datetime.datetime.now().timestamp()) + ASCSET_DELAY
+        return f"0,{option},1: {effective_at}"
+
     def on(self):
         """
         Enable hashing on the miner.
@@ -279,7 +301,10 @@ class ApiMiner(ApiCommon):
         Returns:
             bool: True on success, False otherwise.
         """
-        command = {"command": "ascset", "parameter": ASCSET_ON}
+        command = {
+            "command": "ascset",
+            "parameter": self._ascset_soft_parameter(ASCSET_ON),
+        }
 
         if self.dry_run:
             self.log.info(
@@ -313,7 +338,10 @@ class ApiMiner(ApiCommon):
         Returns:
             bool: True on success, False otherwise.
         """
-        command = {"command": "ascset", "parameter": ASCSET_OFF}
+        command = {
+            "command": "ascset",
+            "parameter": self._ascset_soft_parameter(ASCSET_OFF),
+        }
 
         if self.dry_run:
             self.log.info(
@@ -509,7 +537,7 @@ class ApiMiner(ApiCommon):
         try:
             # Power consumption and profitability per 24h
             mode_profit = WORKMODE_AVERAGE_PROFITABILITY[mode]
-            mode_consumption = WORKMODE_POWER_CONSUMPTION[mode]
+            mode_consumption = WORKMODE_POWER_CONSUMPTION[mode]*24/1000
         except KeyError:
             self.log.error(
                 f"Unknown Avalon Q operating mode '{mode}'! Expected one of "

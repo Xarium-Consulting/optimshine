@@ -66,7 +66,8 @@ class ApiWeather(ApiCommon):
 
     def _get_solar_sunrise_sunset_time(self, latitude, longitude, date):
         """
-        Retrieves the sunrise and sunset times for a given location and date.
+        Retrieves the sunrise and sunset times for a given location and date
+        and sunrise for next day.
 
         Args:
             latitude (float): The latitude of the location.
@@ -78,14 +79,21 @@ class ApiWeather(ApiCommon):
             bool: True if the sunrise and sunset times were successfully
                   obtained, False otherwise.
         """
+        self.sunrise_tomorrow = None
+        tomorrow = (
+            datetime.date.fromisoformat(date) + datetime.timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+
         sunrise_url = "https://api.sunrise-sunset.org/json?"
         sunrise_args = f"lat={latitude}&lng={longitude}&date={date}"
+        sunrise_tomorrow_args = (f"lat={latitude}&lng={longitude}"
+                                 f"&date={tomorrow}")
 
-        self.log.debug("Sending sunrise/sunset request to"
+        self.log.debug("Sending today sunrise/sunset request to"
                        f" {sunrise_url}{sunrise_args}")
         response = self.api_get_request(f"{sunrise_url}{sunrise_args}")
         if not response:
-            self.log.error("Getting sunrise/sunset data failed!")
+            self.log.error("Getting today sunrise/sunset data failed!")
             return False
         try:
             self.sunrise = response["results"]["sunrise"]
@@ -93,6 +101,25 @@ class ApiWeather(ApiCommon):
         except (TypeError, KeyError):
             self.log.error(f"Getting weather data failed. {response}")
             return False
+
+        self.log.debug("Sending tomorrow sunrise/sunset request to"
+                       f" {sunrise_url}{sunrise_tomorrow_args}")
+        response = self.api_get_request(
+            f"{sunrise_url}{sunrise_tomorrow_args}"
+        )
+        if not response:
+            self.log.error("Getting tomorrow sunrise/sunset data failed!")
+            return False
+        try:
+            sunrise_tomorrow = response["results"]["sunrise"]
+        except (TypeError, KeyError):
+            self.log.error(f"Getting weather data failed. {response}")
+            return False
+
+        self.sunrise_tomorrow = datetime.datetime.strptime(
+            f"{tomorrow} {sunrise_tomorrow}",
+            "%Y-%m-%d %I:%M:%S %p",
+        ).replace(tzinfo=ZoneInfo("UTC")).astimezone()
 
         self.log.info("Sunrise/sunset time obtained successfully.")
         return True
@@ -182,6 +209,7 @@ class ApiWeather(ApiCommon):
                 "low_clouds_data": low_clouds_data[:24],
                 "sunrise_time": sunrise_hour_ts,
                 "sunset_time": sunset_hour_ts,
+                "sunrise_tomorrow_time": self.sunrise_tomorrow,
             }
             self.log.info("Weather data obtained successfully")
             return True
@@ -213,6 +241,7 @@ class ApiWeather(ApiCommon):
                 "low_clouds_data": striped_cloud_data,
                 "sunrise_time": sunrise_hour_ts,
                 "sunset_time": sunset_hour_ts,
+                "sunrise_tomorrow_time": self.sunrise_tomorrow,
             }
         self.log.info("Weather data obtained successfully")
         return True

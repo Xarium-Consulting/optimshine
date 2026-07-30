@@ -1056,8 +1056,12 @@ class TestApiMiner(unittest.TestCase):
         ) as mock_send:
             cls_api_miner.on()
 
-        mock_send.assert_called_once_with(
-            {"command": "ascset", "parameter": api.ASCSET_ON}
+        command = mock_send.call_args.args[0]
+        self.assertEqual(command["command"], "ascset")
+        # Payload has the shape "0,softon,1: <future_unix_timestamp>".
+        self.assertRegex(
+            command["parameter"],
+            rf"^0,{api.ASCSET_ON},1: \d+$",
         )
 
     # off() sends the correct ascset power-off payload when not dry-run.
@@ -1073,8 +1077,12 @@ class TestApiMiner(unittest.TestCase):
         ) as mock_send:
             cls_api_miner.off()
 
-        mock_send.assert_called_once_with(
-            {"command": "ascset", "parameter": api.ASCSET_OFF}
+        command = mock_send.call_args.args[0]
+        self.assertEqual(command["command"], "ascset")
+        # Payload has the shape "0,softoff,1: <future_unix_timestamp>".
+        self.assertRegex(
+            command["parameter"],
+            rf"^0,{api.ASCSET_OFF},1: \d+$",
         )
 
     # on() returns True when the response status indicates success.
@@ -1493,22 +1501,22 @@ class TestApiMiner(unittest.TestCase):
         self.log.addHandler(handler)
         self.log.setLevel(logging.INFO)
 
-        # The exact command payload the operation is expected to log.
+        # A fragment of the exact command payload the operation is expected to
+        # log. on/off carry a dynamic timestamp, so only the stable prefix is
+        # checked for those.
         if op_name == "on":
-            expected_command = {
-                "command": "ascset",
-                "parameter": api.ASCSET_ON,
-            }
+            expected_fragment = (
+                f"'command': 'ascset', 'parameter': '0,{api.ASCSET_ON},1: "
+            )
         elif op_name == "off":
-            expected_command = {
-                "command": "ascset",
-                "parameter": api.ASCSET_OFF,
-            }
+            expected_fragment = (
+                f"'command': 'ascset', 'parameter': '0,{api.ASCSET_OFF},1: "
+            )
         else:
-            expected_command = {
+            expected_fragment = str({
                 "command": "ascset",
                 "parameter": f"0,workmode,set,{api.WORKMODE_MAP[mode]}",
-            }
+            })
 
         # Patch both the transport helper and the raw socket factory so the
         # test can prove neither is invoked in dry-run mode.
@@ -1531,9 +1539,9 @@ class TestApiMiner(unittest.TestCase):
         mock_send.assert_not_called()
         mock_conn.assert_not_called()
 
-        # The exact payload that would have been transmitted is present in the
+        # The payload that would have been transmitted is present in the
         # captured INFO-level log output.
-        self.assertIn(str(expected_command), stdio.getvalue())
+        self.assertIn(expected_fragment, stdio.getvalue())
 
     # ------------------------------------------------------------------ #
     # Task 10.2: property test for dry-run preserving read transmission.  #
