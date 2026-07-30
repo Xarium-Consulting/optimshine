@@ -11,8 +11,12 @@ import unittest
 
 import optimshine.api_pse as api
 
+from datetime import datetime
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 import optimshine.optim_config as config
+
+WARSAW = ZoneInfo("Europe/Warsaw")
 
 
 class TestPseApi(unittest.TestCase):
@@ -105,10 +109,14 @@ class TestPseApi(unittest.TestCase):
             ]
         }
         expected_date = "2025-05-14"
+        # "dtime" is the END of each period, so the quarter labelled
+        # "00:00 - 00:15" carries dtime 00:15. Prices are keyed by the period
+        # START, resolved in the market timezone rather than the host's, so
+        # this expectation holds on any machine.
         expected_prices = {
-            "2025-06-16 00:15:00": 439.58,
-            "2025-06-16 00:30:00": 449.58,
-            "2025-06-16 00:45:00": 459.58,
+            datetime(2025, 6, 16, 0, 0, tzinfo=WARSAW).timestamp(): 439.58,
+            datetime(2025, 6, 16, 0, 15, tzinfo=WARSAW).timestamp(): 449.58,
+            datetime(2025, 6, 16, 0, 30, tzinfo=WARSAW).timestamp(): 459.58,
         }
 
         cls_api_pse = api.ApiPse(self.log)

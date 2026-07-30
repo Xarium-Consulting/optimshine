@@ -5,7 +5,16 @@
 # SHINE_USER: The username for accessing the SHINE system.
 # SHINE_PASSWORD: The password for the SHINE user.
 # SHINE_PLANT: The plant identifier for the SHINE system.
+# MINER_IP: The IPv4 address of the Avalon Q miner. Leave empty so hardware
+#           integration tests are skipped rather than executed.
+# MINER_PORT: The optional CGMiner API TCP port for the miner (defaults to 4028
+#           when unset).
+# COINGECKO_API_KEY: Api key needed for obtaining BTC price
+#
 TESTVAR=test
 SHINE_USER=test_user
 SHINE_PASSWORD=test_password
 SHINE_PLANT=test_plant
+MINER_IP=
+MINER_PORT=
+COINGECKO_API_KEY=

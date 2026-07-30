@@ -10,12 +10,15 @@ import sys
 import time
 import sdnotify
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from optimshine.api_common import MARKET_TIMEZONE
 from optimshine.api_shine import ApiShine
 from optimshine.api_weather import ApiWeather
 from optimshine.api_pse import ApiPse
+from optimshine.api_miner import (ApiMiner, WORKMODE_MAP,
+                                  WORKMODE_POWER_CONSUMPTION)
 from optimshine.optim_config import OptimConfig
 
 
@@ -27,17 +30,29 @@ CHARGE_MODES = {
 }
 
 
-class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
+class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
     """
     OptimShine is a class that manages the optimization of battery charging
     based on various factors such as weather conditions, plant data, and
     pricing information.
     """
     def __init__(self, envpath='.env'):
+        """
+        Initializes the OptimShine instance.
+
+        Notifies systemd that the service is ready, sets up the logger, loads
+        the environment variables from the given env file and initializes the
+        job scheduler.
+
+        Args:
+            envpath (str, optional): Path to the env file with the
+                                     configuration. Defaults to '.env'.
+        """
         self.judge_date: datetime = None
         self.soc_check_date: datetime = None
         self.optim = False
         self.optim_date: datetime = None
+        self.dry_run = False
 
         self.notifier = sdnotify.SystemdNotifier()
         self.notifier.notify("READY=1")
@@ -128,7 +143,120 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
 
         return True
 
-    def _get_judge_factors(self):
+    def _check_current_weather(self, date, time):
+        """
+        Checks whether it is cloudy at the given date and time.
+
+        Picks the low clouds forecast sample that matches the requested hour
+        and sets ``self.cloudy_now`` to True when the cloud cover exceeds 75%.
+
+        Args:
+            date (str): The date to check, in YYYY-MM-DD format.
+            time (str): The time to check, in "%I:%M:%S %p" format.
+
+        Returns:
+            bool: True if the current weather was determined, False when no
+                  weather data is available or the requested hour falls before
+                  the start or after the end of the forecast range.
+        """
+        self.cloudy_now = False
+
+        if not hasattr(self, "weather_data"):
+            self.log.error("No weather data available!")
+            return False
+
+        hour_ts = self.get_timestamp_hour(date, time)
+        sample_number = (
+            int((hour_ts - self.weather_data["first_sample_time"])
+                / self.weather_data["interval"])
+            )
+        if not 0 <= sample_number < len(self.weather_data["low_clouds_data"]):
+            self.log.error(f"Sample number {sample_number} out of range")
+            return False
+
+        if self.weather_data["low_clouds_data"][sample_number] > 0.75:
+            self.cloudy_now = True
+            return True
+
+        return True
+
+    def _get_current_judge_factors(self):
+        """
+        Gathers the plant-wide factors used to judge the optimization strategy.
+
+        Collects whether it is night, whether it is cloudy right now, the
+        current quarter RCE price, and the miner profitability per operating
+        mode. The gathered values are stored on the instance:
+
+            - self.if_night: True when the sun is below the horizon
+            - self.cloudy_now: set by ``_check_current_weather``
+            - self.current_rce_price: current quarter RCE price (PLN/kWh)
+            - self.miner_profitability: {mode: PLN/kWh} for each mode, the
+              single source of truth consumed by ``_compare_miner_to_pse``
+
+        Returns:
+            bool: True if all factors were gathered successfully, False
+                  otherwise.
+        """
+        self.if_night = False
+        self.current_rce_price = None
+
+        if not hasattr(self, "weather_data"):
+            self.log.error("No weather data available!")
+            return False
+
+        if not hasattr(self, "rce_prices"):
+            self.log.error("No RCE prices available!")
+            return False
+
+        time_now = datetime.now().timestamp()
+        self.log.debug("Checking if token is valid")
+        if self.token_ttl < time_now and not self.login_shine():
+            self.log.error("Authorization token has expired. "
+                           "Failed to login to Shine API")
+            return False
+
+        # The two lookups below are indexed on different clocks., so each gets
+        # the wall clock it expects instead of the host's local one:
+        #   - RCE quarters are settled on market local time.
+        #   - Weather samples are keyed by get_timestamp_hour, which resolves
+        #     in UTC, matching the forecast timestamps.
+        date_now = datetime.now(tz=timezone.utc)
+        market_now = date_now.astimezone(MARKET_TIMEZONE)
+        market_date = market_now.strftime("%Y-%m-%d")
+        market_time = market_now.strftime("%I:%M:%S %p")
+        utc_date = date_now.strftime("%Y-%m-%d")
+        utc_time = date_now.strftime("%I:%M:%S %p")
+        date_ts = date_now.timestamp()
+        quarter_ts = self.get_timestamp_quarter(market_date, market_time)
+
+        if (self.weather_data["sunrise_time"] > date_ts
+                or self.weather_data["sunset_time"] < date_ts):
+            self.if_night = True
+        elif not self._check_current_weather(utc_date, utc_time):
+            self.log.error("Checking current weather failed!")
+            return False
+
+        try:
+            self.current_rce_price = self.rce_prices[quarter_ts]/1000
+            self.log.debug(f"Current PSE price: {self.current_rce_price}")
+        except KeyError:
+            self.log.error("Current quarter not found in RCE prices")
+            return False
+
+        self.log.debug("Getting miner profitability")
+        self.miner_profitability = {}
+        for mode in WORKMODE_MAP:
+            if not self.get_current_miner_profitability(mode):
+                self.log.error("Getting miner profitability failed")
+                return False
+            self.miner_profitability[mode] = self.profitability
+        self.log.debug(f"Miner profitability: {self.miner_profitability}")
+
+        self.log.info("Successfully obtained current judge factors")
+        return True
+
+    def _get_daily_judge_factors(self):
         """
         Retrieves judge factors based on plant information and weather data and
         RCE energy prices.
@@ -141,7 +269,9 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
             self.log.error("No plant info available")
             return False
 
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = datetime.now(tz=timezone.utc).astimezone(
+            MARKET_TIMEZONE
+        ).strftime("%Y-%m-%d")
 
         self.log.debug("Trying to get weather data")
         if not self._check_weather(self.plant["latitude"],
@@ -159,13 +289,7 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
         self.min_price = next(iter(self.rce_prices.values()))
         for quarter, price in self.rce_prices.items():
             if price < self.min_price:
-                time = datetime.strptime(quarter, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=ZoneInfo("Europe/Warsaw")
-                ).astimezone(ZoneInfo("UTC"))
-                self.min_price_timestamp = self.get_timestamp_hour(
-                    time.strftime("%Y-%m-%d"),
-                    time.strftime("%I:%M:%S %p")
-                )
+                self.min_price_timestamp = quarter
                 self.min_price = price
 
         self.log.debug(f"min_price_timestamp: {self.min_price_timestamp}")
@@ -173,6 +297,203 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
 
         self.log.info("Successfully obtained judge factors")
         return True
+
+    def _get_inverter_judge_factors(self, inverter, night=False):
+        """
+        Reads the per-inverter factors used to judge the optimization strategy.
+
+        Always reads the battery state of charge. The PV production is read
+        only during the day, since it is always zero at night.
+
+        Args:
+            inverter (object): The inverter to read the values from.
+            night (bool, optional): When True the PV production read is
+                                    skipped. Defaults to False.
+
+        Returns:
+            tuple: ``(state_of_charge, pv_production)`` on success. The PV
+                   production is None when ``night`` is True. Returns
+                   ``(None, None)`` when reading a value failed.
+        """
+        self.log.debug("Getting battery state of charge")
+        if not self.get_device_value(inverter, "battery_soc"):
+            self.log.error("Getting battery state of charge failed")
+            return (None, None)
+        current_soc = float(self.device_value)
+        self.device_value = None
+        self.log.debug(f"Battery SOC: {current_soc}%")
+
+        if night:
+            self.log.debug("It's night. Omitting PV production")
+            return (current_soc, None)
+        self.log.debug("Getting PV production")
+        if not self.get_device_value(inverter, "pv_power"):
+            self.log.error("Getting PV production failed")
+            return (None, None)
+        current_pv_power = float(self.device_value)
+        self.device_value = None
+        self.log.debug(f"PV production: {current_pv_power} W")
+        return (current_soc, current_pv_power)
+
+    def _compare_miner_to_pse(self):
+        """
+        Compares the current PSE (RCE) energy price against the miner
+        profitability for each operating mode and decides which use of the
+        energy is more valuable.
+
+        Reads the per-mode profitability (PLN/kWh) gathered by
+        ``_get_current_judge_factors`` into ``self.miner_profitability`` and
+        compares each mode to the current PSE price. Among the modes that beat
+        the PSE price the least profitable one is chosen, so the miner runs in
+        the most conservative mode that is still worth running. When no mode
+        beats the PSE price, selling to the grid (PSE) wins.
+
+        ``_get_current_judge_factors`` must have run successfully first, since
+        it provides both the PSE price and the profitability figures.
+
+        Returns:
+            str or None: The operating mode when the miner is more profitable,
+                         the string ``"pse"`` when the PSE price is better, or
+                         None if the current PSE price or the profitability
+                         figures are unavailable.
+        """
+        if not hasattr(self, "current_rce_price") or \
+                self.current_rce_price is None:
+            self.log.error("No current PSE price available!")
+            return None
+
+        if not getattr(self, "miner_profitability", None):
+            self.log.error("No miner profitability available!")
+            return None
+
+        chosen_mode = None
+        chosen_profitability = None
+        for mode, profitability in self.miner_profitability.items():
+            self.log.debug(
+                f"'{mode}' profitability: {profitability} PLN/kWh, "
+                f"current PSE price: {self.current_rce_price} PLN/kWh"
+            )
+
+            if profitability > self.current_rce_price and (
+                chosen_profitability is None
+                or profitability < chosen_profitability
+            ):
+                chosen_profitability = profitability
+                chosen_mode = mode
+
+        if chosen_mode is not None:
+            self.log.info(f"Miner is more profitable in '{chosen_mode}' mode")
+            return chosen_mode
+
+        self.log.info("PSE price is more profitable")
+        return "pse"
+
+    def _compare_miner_to_pv_prod(self, inverter_pv):
+        """
+        Compares the miner power consumption of each operating mode against the
+        available PV production and selects the most demanding mode the PV
+        production can still cover.
+
+        For every mode in WORKMODE_POWER_CONSUMPTION the power consumption is
+        compared to ``inverter_pv``. The mode with the highest consumption that
+        is still fully covered by the PV production is chosen.
+
+        Args:
+            inverter_pv (float): The available PV production.
+
+        Returns:
+            str: The most demanding operating mode the PV production can cover,
+                 or the string ``"TOO_LOW"`` when no mode is covered.
+        """
+        chosen_mode = None
+        chosen_consumption = None
+        for mode, consumption in WORKMODE_POWER_CONSUMPTION.items():
+            self.log.debug(
+                f"'{mode}' power consumption: {consumption}, "
+                f"PV production: {inverter_pv}"
+            )
+            if consumption <= inverter_pv and (
+                chosen_consumption is None
+                or consumption > chosen_consumption
+            ):
+                chosen_consumption = consumption
+                chosen_mode = mode
+
+        if chosen_mode is not None:
+            self.log.info(f"PV production covers '{chosen_mode}' mode")
+            return chosen_mode
+
+        self.log.info("PV production is too low for any miner mode")
+        return "TOO_LOW"
+
+    def _select_miner_mode(self, inverter_pv):
+        """
+        Selects the miner operating mode to run, if any.
+
+        A mode is only worth running when it satisfies both constraints at
+        once:
+
+            - its profitability beats the current RCE price, otherwise the
+              energy is worth more sold to the grid
+            - its power consumption is covered by the available PV production
+
+        Checking the two separately is not equivalent: profitability falls as
+        consumption rises, so the most demanding mode the PV production can
+        cover may still lose to the grid price. Among the modes that satisfy
+        both, the least profitable one is chosen, which keeps the miner in the
+        most conservative mode that is still worth running.
+
+        Args:
+            inverter_pv (float): The available PV production, in watts.
+
+        Returns:
+            str or None: The operating mode to run, ``"pse"`` when no mode
+                         beats the current RCE price, ``"TOO_LOW"`` when the PV
+                         production covers no profitable mode, or None when the
+                         RCE price or the profitability figures are
+                         unavailable.
+        """
+        if not hasattr(self, "current_rce_price") or \
+                self.current_rce_price is None:
+            self.log.error("No current PSE price available!")
+            return None
+
+        if not getattr(self, "miner_profitability", None):
+            self.log.error("No miner profitability available!")
+            return None
+
+        profitable = {}
+        for mode, profitability in self.miner_profitability.items():
+            if profitability > self.current_rce_price:
+                profitable[mode] = profitability
+
+        if not profitable:
+            self.log.info("PSE price is more profitable")
+            return "pse"
+
+        chosen_mode = None
+        chosen_profitability = None
+        for mode, profitability in profitable.items():
+            consumption = WORKMODE_POWER_CONSUMPTION[mode]
+            self.log.debug(
+                f"'{mode}' profitability: {profitability} PLN/kWh beats "
+                f"{self.current_rce_price} PLN/kWh, consumption "
+                f"{consumption} W vs PV production {inverter_pv} W"
+            )
+            if consumption <= inverter_pv and (
+                chosen_profitability is None
+                or profitability < chosen_profitability
+            ):
+                chosen_profitability = profitability
+                chosen_mode = mode
+
+        if chosen_mode is None:
+            self.log.info("PV production is too low for any profitable miner "
+                          "mode")
+            return "TOO_LOW"
+
+        self.log.info(f"Mining is worthwhile in '{chosen_mode}' mode")
+        return chosen_mode
 
     def optim_charge_battery(self, inverter, mode):
         """
@@ -219,7 +540,6 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
         if setting_charge_current == target_charge_current:
             self.log.info("Correct charge current value is already set. "
                           "Battery charging optimization was successful")
-            self.scheduler_list_jobs()
             return True
 
         if not self.set_charge_current(inverter, target_charge_current):
@@ -240,168 +560,299 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
             self.log.error("Failed to set battery charge current. "
                            "Wrong current value")
             raise RuntimeError
-        self.scheduler_list_jobs()
         self.log.info("Battery charging optimization was successful")
         return True
 
-    def optim_soc_check(self, inverter):
+    def optim_strategy_night(self):
         """
-        Checks the state of charge (SOC) of the battery connected to the
-        specified inverter. If the SOC is below 50%, it initiates a slow
-        charge. If the SOC is sufficient, it sets the battery to no charge
-        mode and prepares for optimization.
-        Args:
-            inverter (str): The identifier for the inverter to check.
+        Sets up the optimization strategy for nighttime.
+
+        Hands over to the day strategy when the sun is already up. Otherwise it
+        reads the battery state of charge of every inverter and either stops
+        mining (state of charge at or below 35%) or mines in Eco mode. The next
+        night optimization run is scheduled 15 minutes ahead.
 
         Returns:
-            bool: True if the battery is ready for optimization or if the SOC
-                   check was successfully scheduled.
+            bool: True when the day strategy was scheduled instead. None is
+                  returned after a regular night optimization pass.
 
         Raises:
-            RuntimeError: If there is an issue with authorization, or if
-                          retrieving the battery state of charge fails.
+            RuntimeError: If the inverter list or the weather data is missing,
+                          or if reading the inverter values failed.
         """
-        time_now = datetime.now().timestamp()
-        self.log.debug("Checking if token is valid")
-        if self.token_ttl < time_now and not self.login_shine():
-            self.log.error("Authorization token has expired. "
-                           "Failed to login to Shine API")
-            raise RuntimeError
-
-        self.log.debug("Getting battery state of charge")
-        if not self.get_device_value(inverter, "battery_soc"):
-            self.log.error("Getting battery state of charge failed")
-            raise RuntimeError
-
-        soc_value = float(self.device_value)
-        self.device_value = None
-        self.log.debug(f"Battery SOC: {soc_value}%")
-
-        if soc_value < 50:
-            self.log.info("Battery needs to be charge before optimization")
-            self.optim_charge_battery(inverter, "slow_charge")
-        else:
-            self.optim_charge_battery(inverter, "no_charge")
-            self.log.info("Battery is ready for optimization. "
-                          "No charge mode set")
-            return True
-
-        self.log.info("Scheduling next soc check in 30 minutes")
-        next_soc_check_date = time_now + 1800
-        if next_soc_check_date < (self.optim_date.timestamp()-180):
-            self.soc_check_date = datetime.fromtimestamp(next_soc_check_date)
-            self.scheduler.add_job(
-                self.optim_soc_check,
-                trigger="date",
-                run_date=self.soc_check_date,
-                id=f"optim_soc_check_inv_{inverter}",
-                replace_existing=True,
-                kwargs={"inverter": inverter}
-            )
-        self.scheduler_list_jobs()
-        return True
-
-    def _optim_strategy(self):
-        """
-        Determines and sets the optimization strategy for battery charging
-        based on various conditions such as optimization status, dates,
-        minimum price, and inverter availability. It schedules jobs for
-        optimizing state of charge (SOC) checks and battery charging based
-        on the current time and weather data.
-
-        Returns:
-            bool: True if the optimization strategy was set successfully or
-                  if optimization is not needed, False if there are issues
-                  with the optimization parameters.
-        """
-        if not self.optim:
-            self.log.info("Optimization not needed")
-            return True
-
-        if not self.optim_date or not self.soc_check_date:
-            self.log.error("Optimization dates not set")
-            return False
-
-        if not self.min_price:
-            self.log.error("RCE minimal price price not set")
-            return False
-
         if not hasattr(self, "inverters") or not self.inverters:
             self.log.error("No inverter list found")
-            return False
+            raise RuntimeError
 
-        if self.min_price < 0:
-            charging_mode = "fast_charge"
-        else:
-            charging_mode = "normal_charge"
+        if not hasattr(self, "weather_data"):
+            self.log.error("No weather data available")
+            raise RuntimeError
 
         time_now = datetime.now().timestamp()
-        if time_now > self.optim_date.timestamp():
-            self.log.warning("Optimization time was missed")
-            self.optim = False
-            self.soc_check_date = None
-            self.optim_date = None
+
+        if (self.weather_data["sunrise_tomorrow_time"].timestamp() < time_now
+            or (self.weather_data["sunset_time"] > time_now and
+                self.weather_data["sunrise_time"] < time_now)):
+            self.log.info("It's day. Run day optimization.")
+            self.scheduler.add_job(
+                self.optim_strategy_day,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(seconds=15)),
+                id="optim_strategy_day",
+                replace_existing=True
+            )
             return True
 
-        if time_now > self.soc_check_date.timestamp():
-            self.soc_check_date = (datetime.fromtimestamp(time_now) +
-                                   timedelta(seconds=30))
+        for inverter in self.inverters:
+            inverter_soc = None
+            inverter_soc, _ = (
+                self._get_inverter_judge_factors(inverter, night=True)
+            )
+            if inverter_soc is None:
+                self.log.error("Failed to get inverter values")
+                self.scheduler.add_job(
+                    self.optim_strategy_night,
+                    trigger="date",
+                    run_date=(datetime.now() + timedelta(minutes=15)),
+                    id="optim_strategy_night",
+                    replace_existing=True
+                )
+                raise RuntimeError
+
+            if inverter_soc <= 35:
+                self.log.debug("Battery state low. Not mining until it's"
+                               " at least 35%.")
+                self.off()
+            else:
+                self.log.debug("Mining in eco mode.")
+                self.on()
+                time.sleep(20)
+                self.set_mode("Eco")
+
+        self.log.info("Setting optimization strategy was successful")
+        self.scheduler.add_job(
+            self.optim_strategy_night,
+            trigger="date",
+            run_date=(datetime.now() + timedelta(minutes=15)),
+            id="optim_strategy_night",
+            replace_existing=True
+        )
+        self.log.info("Scheduling next night optimization in 15 minutes")
+        self.scheduler_list_jobs()
+
+    def optim_strategy_day(self):
+        """
+        Determines and applies the daytime optimization strategy.
+
+        Hands over to the night strategy after sunset. A negative RCE price is
+        handled for the whole plant at once, since importing energy pays
+        regardless of the individual inverter readings. Otherwise, for every
+        inverter, it combines the current RCE price, the cloud cover, the
+        battery state of charge and the PV production to decide the battery
+        charge mode and whether the miner should run, and in which mode:
+
+            - negative RCE price: every battery fast charges and the miner
+              runs in Super mode
+            - cloudy, low battery: fast charge, miner off
+            - cloudy, full battery: mine in the mode chosen by
+              ``_select_miner_mode``, otherwise sell the energy
+            - sunny, low battery: fast charge, miner off
+            - sunny, high RCE price: no charge, miner off
+            - sunny otherwise: slow charge (fast charge close to sunset) and
+              mine in the mode chosen by ``_select_miner_mode``
+
+        A mode is only used when it both beats the current RCE price and is
+        covered by the PV production. See ``_select_miner_mode``.
+
+        The next day optimization run is scheduled 15 minutes ahead.
+
+        Note that the miner is a single shared device, so its commands are
+        still issued once per inverter inside the loop below. With more than
+        one inverter the last iteration wins.
+
+        Returns:
+            bool: True when the night strategy was scheduled instead or when
+                  the negative price branch handled the whole plant. None is
+                  returned after a regular day optimization pass.
+
+        Raises:
+            RuntimeError: If the inverter list, the weather data or the daily
+                          weather info is missing, or if getting the judge
+                          factors or the inverter values failed.
+        """
+        if not hasattr(self, "inverters") or not self.inverters:
+            self.log.error("No inverter list found")
+            raise RuntimeError
+
+        if not hasattr(self, "weather_data"):
+            self.log.error("No weather data available")
+            raise RuntimeError
+
+        if not hasattr(self, "not_cloudy"):
+            self.log.error("No daily weather info")
+            raise RuntimeError
+
+        if datetime.now().timestamp() > self.weather_data["sunset_time"]:
+            self.log.info("It's night. Run night optimization.")
+            self.scheduler.add_job(
+                self.optim_strategy_night,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(seconds=15)),
+                id="optim_strategy_night",
+                replace_existing=True
+            )
+            self.scheduler_list_jobs()
+            return True
+
+        if not self._get_current_judge_factors():
+            self.log.error("Failed to get current judge factors")
+            self.scheduler.add_job(
+                self.optim_strategy_day,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(minutes=15)),
+                id="optim_strategy_day",
+                replace_existing=True
+            )
+            self.scheduler_list_jobs()
+            raise RuntimeError
+
+        if self.current_rce_price < 0:
+            self.log.info("Negative energy price. "
+                          "Charging battery and mining")
+            for inverter in self.inverters:
+                self.optim_charge_battery(inverter, "fast_charge")
+            self.on()
+            time.sleep(20)
+            self.set_mode("Super")
+            self.scheduler.add_job(
+                self.optim_strategy_day,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(minutes=15)),
+                id="optim_strategy_day",
+                replace_existing=True
+            )
+            self.log.info("Scheduling next day optimization in 15 minutes")
+            self.scheduler_list_jobs()
+            return True
 
         for inverter in self.inverters:
-            self.log.info("Setting optimization strategy for inverter nr"
-                          f" {inverter}")
-            if not (self.soc_check_date.timestamp() >
-                    (self.optim_date.timestamp()-180)):
-                self.scheduler.add_job(
-                    self.optim_soc_check,
-                    trigger="date",
-                    run_date=self.soc_check_date,
-                    id=f"optim_soc_check_inv_{inverter}",
-                    replace_existing=True,
-                    kwargs={"inverter": inverter}
-                )
-            self.scheduler.add_job(
-                self.optim_charge_battery,
-                trigger="date",
-                run_date=self.optim_date,
-                id=f"optim_charge_battery_inv_{inverter}",
-                replace_existing=True,
-                kwargs={"inverter": inverter, "mode": charging_mode}
+            inverter_soc = None
+            inverter_pv = None
+            inverter_soc, inverter_pv = (
+                self._get_inverter_judge_factors(inverter)
             )
-            if not (self.weather_data["sunrise_time"] >=
-                    self.weather_data["sunset_time"]):
+            if inverter_soc is None or inverter_pv is None:
+                self.log.error("Failed to get inverter values")
                 self.scheduler.add_job(
-                    self.optim_charge_battery,
+                    self.optim_strategy_day,
                     trigger="date",
-                    run_date=datetime.fromtimestamp(
-                        self.weather_data["sunset_time"]
-                    ),
-                    id=f"eod_charge_battery_inv_{inverter}",
-                    replace_existing=True,
-                    kwargs={
-                        "inverter": inverter,
-                        "mode": "slow_charge",
-                    }
+                    run_date=(datetime.now() + timedelta(minutes=15)),
+                    id="optim_strategy_day",
+                    replace_existing=True
                 )
+                self.scheduler_list_jobs()
+                raise RuntimeError
+
+            if self.cloudy_now:
+                if inverter_soc < 80:
+                    self.log.info("Cloudy weather, low battery")
+                    self.optim_charge_battery(inverter, "fast_charge")
+                    self.off()
+                else:
+                    self.log.info("Cloudy weather, full battery")
+                    mode = self._select_miner_mode(inverter_pv)
+                    if mode is None or mode == "pse":
+                        self.log.info("Charging battery and selling energy")
+                        self.off()
+                    elif mode == "TOO_LOW":
+                        self.log.info("Too low production to mine, charging "
+                                      "battery and selling energy")
+                        self.off()
+                    else:
+                        self.log.info(f"Mining in {mode} mode.")
+                        self.on()
+                        time.sleep(20)
+                        self.set_mode(mode)
+            else:
+                buffer_time = (datetime.now() + timedelta(hours=3)).timestamp()
+                if inverter_soc < 35:
+                    self.log.info("Sunny weather. Low battery.")
+                    self.optim_charge_battery(inverter, "fast_charge")
+                    self.off()
+                elif self.weather_data["sunset_time"] > buffer_time:
+                    if self.current_rce_price > 0.6:
+                        self.log.info("Sunny weather. High PSE price:"
+                                      f" {self.current_rce_price}")
+                        self.optim_charge_battery(inverter, "no_charge")
+                        self.off()
+                    else:
+                        self.optim_charge_battery(inverter, "slow_charge")
+                        self.log.info("Sunny weather.")
+                        mode = self._select_miner_mode(inverter_pv)
+                        if mode is None or mode == "pse":
+                            self.log.info("Charging battery and selling"
+                                          " energy")
+                            self.off()
+                        elif mode == "TOO_LOW":
+                            self.log.info("Too low production to mine, "
+                                          "charging battery and selling "
+                                          "energy")
+                            self.off()
+                        else:
+                            self.log.info(f"Mining in {mode} mode")
+                            self.on()
+                            time.sleep(20)
+                            self.set_mode(mode)
+                else:
+                    self.log.info("Sunny weather. Almost dark,"
+                                  " charging battery.")
+                    self.optim_charge_battery(inverter, "fast_charge")
+                    mode = self._select_miner_mode(inverter_pv)
+                    if mode is None or mode == "pse":
+                        self.log.info("Charging battery and selling"
+                                      " energy")
+                        self.off()
+                    elif mode == "TOO_LOW":
+                        self.log.info("Too low production to mine, charging"
+                                      " battery and selling energy")
+                        self.off()
+                    else:
+                        self.log.info(f"Mining in {mode} mode")
+                        self.on()
+                        time.sleep(20)
+                        self.set_mode(mode)
+
         self.log.info("Setting optimization strategy was successful")
-        return True
+        self.scheduler.add_job(
+            self.optim_strategy_day,
+            trigger="date",
+            run_date=(datetime.now() + timedelta(minutes=15)),
+            id="optim_strategy_day",
+            replace_existing=True
+        )
+        self.log.info("Scheduling next day optimization in 15 minutes")
+        self.scheduler_list_jobs()
 
     def optim_judge(self):
         """
         Evaluates weather data and energy prices to determine
         the optimization strategy.
 
+        Gets the daily judge factors and starts either the day or the night
+        strategy depending on whether the judge ran before sunset. Tomorrow's
+        judge is then scheduled based on tomorrow's sunrise time. When getting
+        the judge factors fails, the judge is rescheduled 30 minutes ahead.
+
         Raises:
-            RuntimeError: If judge factors retrieval or optimization
-                          strategy setup fails.
+            RuntimeError: If judge factors retrieval fails.
         """
         self.log.info("Getting weather data and energy prices")
-        if not self._get_judge_factors():
+        if not self._get_daily_judge_factors():
             self.log.warning("Failed to get judge factors")
             self.judge_date += timedelta(minutes=30)
             self.log.info(
                 "Rescheduling optimization judge to "
-                f"{self.judge_date.strftime('%d-%m-%Y %H:%M')}"
+                f"{self.judge_date.astimezone().strftime('%d-%m-%Y %H:%M')}"
             )
             self.scheduler.add_job(
                 self.optim_judge,
@@ -411,41 +862,35 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
                 replace_existing=True)
             raise RuntimeError
 
-        if self.judge_date.timestamp() > self.weather_data["sunrise_time"]:
-            self.soc_check_date = self.judge_date + timedelta(minutes=2)
-        else:
-            self.soc_check_date = datetime.fromtimestamp(
-                self.weather_data["sunrise_time"]
-            )
-
         if self.not_cloudy:
             # https://www.youtube.com/watch?v=-Hv8fj8hQlE
             self.log.info("It'll be sunny day")
-            self.optim = True
-            self.optim_date = datetime.fromtimestamp(self.min_price_timestamp)
         else:
             # https://www.youtube.com/watch?v=aSLZFdqwh7E
             self.log.info("It'll be cloudy day")
-            self.optim = False
-            self.optim_date = None
-            self.soc_check_date = None
 
-        self.log.debug(f"Optim flag: {self.optim}")
-        self.log.debug(f"Optim date: {self.optim_date}")
-        self.log.debug(f"State of charge check date: {self.soc_check_date}")
         self.log.info("Setting up optimization strategy")
-        if not self._optim_strategy():
-            self.log.error("Setting optimization strategy failed")
-            raise RuntimeError
+        if self.judge_date.timestamp() < self.weather_data["sunset_time"]:
+            self.scheduler.add_job(
+                self.optim_strategy_day,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(seconds=10)),
+                id="optim_strategy_day",
+                replace_existing=True
+            )
+        else:
+            self.scheduler.add_job(
+                self.optim_strategy_night,
+                trigger="date",
+                run_date=(datetime.now() + timedelta(seconds=10)),
+                id="optim_strategy_night",
+                replace_existing=True
+            )
 
         self.log.info("Scheduling tomorrow's optimization judge")
-        # Based on publication dates tomorrow 4:06AM UTC
+        # Based on tomorrow sunrise time
 
-        self.judge_date = (
-            datetime.now().astimezone(ZoneInfo("UTC")).replace(
-                hour=4, minute=6, second=0, microsecond=0
-            ) + timedelta(days=1)
-        )
+        self.judge_date = self.weather_data["sunrise_tomorrow_time"]
         self.scheduler.add_job(
             self.optim_judge,
             trigger="date",
@@ -459,20 +904,22 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather):
         """
         Main function to set up and schedule the optimization judge.
 
+        Sets up the Shine API connection, schedules the first optimization
+        judge one minute ahead and starts the scheduler. Keeps notifying the
+        systemd watchdog while there are scheduled or running jobs.
+
         Raises:
             SystemExit: Exits the program if no jobs are scheduled.
         """
         self._shine_setup()
 
         time_now = datetime.now().astimezone(ZoneInfo("UTC"))
-        self.judge_date = time_now.replace(
-            hour=4, minute=6, second=0, microsecond=0
-        )
-        if time_now.timestamp() > self.judge_date.timestamp():
-            self.judge_date += timedelta(days=1)
+        self.judge_date = time_now + timedelta(minutes=1)
 
-        self.log.info("Scheduling optimization judge to "
-                      f"{self.judge_date.strftime('%d-%m-%Y %H:%M')}")
+        self.log.info(
+            "Scheduling optimization judge to "
+            f"{self.judge_date.astimezone().strftime('%d-%m-%Y %H:%M')}"
+        )
         self.scheduler.add_job(
             self.optim_judge,
             trigger="date",

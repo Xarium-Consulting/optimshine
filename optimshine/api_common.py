@@ -9,12 +9,15 @@ import datetime
 import requests
 
 from logging import RootLogger
+from zoneinfo import ZoneInfo
 
 HEADERS = {
     "Content-Type": "application/json",
     "lang": "en_US",
     "User-Agent": "Mozilla/5.0"
 }
+
+MARKET_TIMEZONE = ZoneInfo("Europe/Warsaw")
 
 
 class ApiCommon:
@@ -23,6 +26,12 @@ class ApiCommon:
     GET requests.
     """
     def __init__(self, log: RootLogger):
+        """
+        Initialize the API client.
+
+        Args:
+            log (RootLogger): The logger used for all logging.
+        """
         self.log = log
 
     def api_post_request(self, api_url, request, token=None):
@@ -66,7 +75,7 @@ class ApiCommon:
             )
             return None
 
-    def api_get_request(self, api_url):
+    def api_get_request(self, api_url, extra_headers=None):
         """
         Sends a GET request to the specified API URL and returns
         the JSON response.
@@ -74,6 +83,9 @@ class ApiCommon:
         Args:
             api_url (str): The URL of the API endpoint to send the GET
                            request to.
+            extra_headers (dict, optional): Additional headers to merge into
+                                            the default request headers, for
+                                            example an API key header.
 
         Returns:
             dict or None: The JSON response from the API if the request is
@@ -82,6 +94,8 @@ class ApiCommon:
                           be decoded.
         """
         headers = HEADERS.copy()
+        if extra_headers:
+            headers.update(extra_headers)
         response = requests.get(
             api_url,
             headers=headers

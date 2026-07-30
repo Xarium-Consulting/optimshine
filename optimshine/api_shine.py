@@ -11,7 +11,7 @@ import os
 import time
 
 from logging import RootLogger
-from optimshine.api_common import ApiCommon
+from optimshine.api_common import ApiCommon, MARKET_TIMEZONE
 
 SHINE_API_URL = "https://shine-api.felicitysolar.com"
 SHINE_API_ENDPOINTS = {
@@ -31,7 +31,8 @@ SHINE_PV_DATA_LABELS = {
     "emsPower": "Battery Power",
 }
 SHINE_DEVICE_VALUES = {
-    "battery_soc": "emsSoc"
+    "battery_soc": "emsSoc",
+    "pv_power": "pvTotalPower",
 }
 SHINE_SETTING_VALUES = {
     "battery_charge_current": "bmchc",
@@ -49,6 +50,12 @@ class ApiShine(ApiCommon):
     settings and device values.
     """
     def __init__(self, log: RootLogger):
+        """
+        Initialize the Shine API client.
+
+        Args:
+            log (RootLogger): The logger used for all logging.
+        """
         self.log = log
 
     def _get_shine_api_url(self, endpoint):
@@ -392,7 +399,8 @@ class ApiShine(ApiCommon):
         Args:
             inverter_serial_number (str): The serial number of the inverter.
             value_name (str): The name of the value to retrieve.
-                              Currently supported value names: battery_soc
+                              Currently supported value names: battery_soc,
+                              pv_power
 
         Returns:
             bool: True if the value was successfully obtained, False otherwise.
@@ -480,6 +488,26 @@ class ApiShine(ApiCommon):
         return False
 
     def set_charge_current(self, inverter_serial_number, current):
+        """
+        Sets the battery charge current on a given inverter.
+
+        Sends a setting command for the "bmchc" field and then polls
+        ``_setting_command_status`` until the inverter reports the command as
+        applied, so a True result means the value was accepted rather than
+        merely submitted.
+
+        Args:
+            inverter_serial_number (str): The serial number of the inverter.
+            current (float or int): The charge current to set, in amperes. It
+                                    is sent as a decimal string, so 60 becomes
+                                    "60.0".
+
+        Returns:
+            bool: True if the command was accepted and confirmed by the
+                  inverter, False if the session is unauthorized, the request
+                  failed, the response carried no command id, or the command
+                  did not reach a successful status before timing out.
+        """
         if not hasattr(self, "token"):
             self.log.error("Session is not authorized!")
             return False
@@ -491,7 +519,7 @@ class ApiShine(ApiCommon):
 
         charge_current_request = {
             "deviceSn": inverter_serial_number,
-            "timeZone": "Europe/Warsaw",
+            "timeZone": str(MARKET_TIMEZONE),
             "timestamp": timestamp_ms,
             "oldVersion": 1,
             "useType": 5,

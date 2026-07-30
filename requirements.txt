@@ -9,12 +9,14 @@ coverage==7.8.0
 cryptography==45.0.3
 freezegun==1.5.1
 h5py==3.13.0
+hypothesis==6.140.2  # test-only
 idna==3.10
 numpy==2.2.5
 pandas==2.2.3
 pvlib==0.12.0
 pycparser==2.22
 PyJWT==2.10.1
+pytest==9.1.1  # test-only
 python-dateutil==2.9.0.post0
 python-dotenv==1.1.0
 pytz==2025.2
