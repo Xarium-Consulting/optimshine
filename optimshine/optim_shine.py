@@ -720,7 +720,10 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
             self.log.info("Negative energy price. "
                           "Charging battery and mining")
             for inverter in self.inverters:
-                self.optim_charge_battery(inverter, "fast_charge")
+                try:
+                    self.optim_charge_battery(inverter, "fast_charge")
+                except (RuntimeError, AttributeError):
+                    self.log.error("Failed to set charge mode")
             self.on()
             time.sleep(20)
             self.set_mode("Super")
@@ -756,7 +759,10 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
             if self.cloudy_now:
                 if inverter_soc < 80:
                     self.log.info("Cloudy weather, low battery")
-                    self.optim_charge_battery(inverter, "fast_charge")
+                    try:
+                        self.optim_charge_battery(inverter, "fast_charge")
+                    except (RuntimeError, AttributeError):
+                        self.log.error("Failed to set charge mode")
                     self.off()
                 else:
                     self.log.info("Cloudy weather, full battery")
@@ -777,16 +783,25 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                 buffer_time = (datetime.now() + timedelta(hours=3)).timestamp()
                 if inverter_soc < 35:
                     self.log.info("Sunny weather. Low battery.")
-                    self.optim_charge_battery(inverter, "fast_charge")
+                    try:
+                        self.optim_charge_battery(inverter, "fast_charge")
+                    except (RuntimeError, AttributeError):
+                        self.log.error("Failed to set charge mode")
                     self.off()
                 elif self.weather_data["sunset_time"] > buffer_time:
                     if self.current_rce_price > 0.6:
                         self.log.info("Sunny weather. High PSE price:"
                                       f" {self.current_rce_price}")
-                        self.optim_charge_battery(inverter, "no_charge")
+                        try:
+                            self.optim_charge_battery(inverter, "no_charge")
+                        except (RuntimeError, AttributeError):
+                            self.log.error("Failed to set charge mode")
                         self.off()
                     else:
-                        self.optim_charge_battery(inverter, "slow_charge")
+                        try:
+                            self.optim_charge_battery(inverter, "slow_charge")
+                        except (RuntimeError, AttributeError):
+                            self.log.error("Failed to set charge mode")
                         self.log.info("Sunny weather.")
                         mode = self._select_miner_mode(inverter_pv)
                         if mode is None or mode == "pse":
@@ -806,7 +821,10 @@ class OptimShine(OptimConfig, ApiPse, ApiShine, ApiWeather, ApiMiner):
                 else:
                     self.log.info("Sunny weather. Almost dark,"
                                   " charging battery.")
-                    self.optim_charge_battery(inverter, "fast_charge")
+                    try:
+                        self.optim_charge_battery(inverter, "fast_charge")
+                    except (RuntimeError, AttributeError):
+                        self.log.error("Failed to set charge mode")
                     mode = self._select_miner_mode(inverter_pv)
                     if mode is None or mode == "pse":
                         self.log.info("Charging battery and selling"
